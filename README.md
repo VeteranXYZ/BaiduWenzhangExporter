@@ -1,15 +1,15 @@
-Baidu-to-WordPress 迁移神器（中文版）
+BaiduWenzhangExporter 百度空间迁移工具
 
-一键导出百度文章 → 生成 CSV + WXR → 清理冗余 → 直接导入 WordPress
+功能:一键导出百度文章 → 生成 CSV + WXR → 清理冗余 → 可直接导入 WordPress
 
 文件结构
-baidu-to-wordpress/
-├── baidu_to_wordpress_ULTRA.py          # 主迁移脚本（原始导出）
-├── clean_baidu_export.py                # 清理脚本（推荐运行）
-├── baidu_articles.csv                   # ← 原始导出（含冗余 HTML）
-├── baidu_wordpress_import.xml           # ← 原始 WXR（可导入但建议清理）
-├── baidu_articles_clean.csv             # ← 清理后 CSV
-└── baidu_wordpress_import_clean.xml     # ← 最终版 WXR（推荐导入）
+BaiduWenzhangExporter/
+-   baidu_to_wordpress_ULTRA.py          # 主迁移脚本（原始导出）
+-   clean_baidu_export.py                # 清理脚本（推荐运行）
+-   baidu_articles.csv                   # ← 原始导出（含冗余 HTML）
+-   baidu_wordpress_import.xml           # ← 原始 WXR（可导入但建议清理）
+-   baidu_articles_clean.csv             # ← 清理后 CSV
+-   baidu_wordpress_import_clean.xml     # ← 最终版 WXR（推荐导入）
 
 使用方法（超简单 3 步）
 
@@ -60,5 +60,7 @@ Q：文章内容有乱码或多余 div？
 A：必须运行 clean_baidu_export.py 清理。
 Q：想保留原始 HTML 结构？
 A：直接用 baidu_articles.csv 手动处理。
+
+2025/11/06
 
 
