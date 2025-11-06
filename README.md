@@ -14,8 +14,8 @@ BaiduWenzhangExporter/
 使用方法
 
 第一步：准备环境
-1. 安装 Python（3.8+）
-2. 安装依赖: pip install selenium beautifulsoup4 lxml webdriver-manager
+安装 Python（3.8+）
+安装依赖: pip install selenium beautifulsoup4 lxml webdriver-manager
 
 第二步：运行迁移脚本（导出原始数据）
 python baidu_to_wordpress_ULTRA.py
