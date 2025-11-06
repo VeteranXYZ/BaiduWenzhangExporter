@@ -1,30 +1,64 @@
-百度文章 → WordPress 一键迁移神器【终极版】无需配置 · 登录回车 · 自动生成 WXR · 支持断点续传
-作者：Grok4 + VeteranXYZ
-适用：所有 wenzhang.baidu.com 用户
-时间：2025 年 11 月 6 日发布
-这是什么？一个 Python 脚本，帮助你：自动抓取 百度文章（wenzhang.baidu.com） 所有博文
-保留 完整 HTML 排版
-提取 准确发布时间
-一键生成 WordPress 标准 WXR 文件
-支持断点续传，中途关机也不怕！
+Baidu-to-WordPress 迁移神器（中文版）
 
-全部文章、排版、时间、分类、原始链接 100% 还原！输出文件说明
+一键导出百度文章 → 生成 CSV + WXR → 清理冗余 → 直接导入 WordPress
 
-baidu_wordpress_export/
-├── baidu_articles.csv                 ← 原始数据（可备份）
-├── baidu_wordpress_import.xml         ← WordPress 导入文件
-└── .progress                          ← 断点记录（可删除重来）
+文件结构
+baidu-to-wordpress/
+├── baidu_to_wordpress_ULTRA.py          # 主迁移脚本（原始导出）
+├── clean_baidu_export.py                # 清理脚本（推荐运行）
+├── baidu_articles.csv                   # ← 原始导出（含冗余 HTML）
+├── baidu_wordpress_import.xml           # ← 原始 WXR（可导入但建议清理）
+├── baidu_articles_clean.csv             # ← 清理后 CSV
+└── baidu_wordpress_import_clean.xml     # ← 最终版 WXR（推荐导入）
 
-免责声明本工具 仅用于个人备份
-请勿用于商业用途或批量抓取
-百度政策变化可能导致失效
+使用方法（超简单 3 步）
 
-致谢感谢 百度文章 陪伴我们多年
-感谢 WordPress 提供永久家园
-感谢 你 愿意保存数字记忆
+第一步：准备环境（只需一次）
+# 1. 安装 Python（3.8+）
+# 2. 安装依赖
+pip install selenium beautifulsoup4 lxml webdriver-manager
 
-星标 + 分享 = 拯救更多记忆把这个项目分享给每一个用过百度空间/百度文章的朋友！
+第二步：运行迁移脚本（导出原始数据）
+python baidu_to_wordpress_ULTRA.py
+操作流程：脚本启动 Chrome 浏览器
+打开 https://wenzhang.baidu.com/
+请手动登录百度账号
+进入 「我的文章」 页面
+按回车键 → 自动滚动加载 + 抓取所有文章
+等待完成 → 生成：baidu_articles.csv
+baidu_wordpress_import.xml
 
-让每一篇旧文，都有新家。
+第三步：运行清理脚本（生成最终版）
+python clean_baidu_export.py
+自动输出：baidu_articles_clean.csv（内容精简）
+baidu_wordpress_import_clean.xml（推荐导入 WordPress）
+
+WordPress 导入说明
+登录 WordPress 后台
+工具 → 导入 → WordPress
+上传 baidu_wordpress_import_clean.xml
+勾选「下载并导入文件附件」（可选）
+点击「提交」→ 全部导入成功！
+
+注意事项
+百度需验证，脚本无法绕过
+每次运行从头开始
+断点续传已关闭，避免重复
+不要直接导入原始 XML
+建议使用 _clean.xml 版本
+Chrome 浏览器会自动下载驱动
+首次运行稍慢，之后秒开
+内容含 <br/> 换行
+保留原始段落格式
+分类固定为「百度文章」
+可在 WP 后台批量修改
+
+常见问题
+Q：导入后文章时间错乱？
+A：使用 baidu_wordpress_import_clean.xml，时间已 100% 修复。
+Q：文章内容有乱码或多余 div？
+A：必须运行 clean_baidu_export.py 清理。
+Q：想保留原始 HTML 结构？
+A：直接用 baidu_articles.csv 手动处理。
 
 
