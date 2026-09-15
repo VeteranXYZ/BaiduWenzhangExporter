@@ -20,8 +20,9 @@ SITE_ROOT = "https://wenzhang.baidu.com"
 
 # 列表接口的确切 URL 是本项目唯一的未知量。
 # 首选来源是 ``import-curl``（从 DevTools 实际请求捕获）；这里的候选仅用于 doctor 自动探测。
-# 第一条是 2026-09 实测确认可用的端点（wd/type 为搜索与类型筛选，留空即全部；
-# _ 是缓存穿透参数，每次请求现取）。其余仅作兜底探测。
+# 第一条由用户从 DevTools 实际请求中捕获（wd/type 为搜索与类型筛选，留空即全部；
+# _ 是缓存穿透参数，每次请求现取）。本工具尚未自行联网验证过它 —— 以 doctor/dry-run
+# 的实际响应为准。后两条是早期在拿到真实 URL 之前的猜测，仅作兜底探测。
 LIST_URL_CANDIDATES = (
     f"{SITE_ROOT}/fav/list?start={{start}}&limit={{limit}}&wd=&type=&getListHtml=1&_={{ts}}",
     f"{SITE_ROOT}/api/getlist?start={{start}}&limit={{limit}}",
