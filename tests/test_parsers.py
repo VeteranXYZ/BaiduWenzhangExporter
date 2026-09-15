@@ -66,11 +66,54 @@ def test_parse_list_html_extracts_metadata(list_response):
     parsed = parse_list_json(list_response)
     records = parse_list_html(parsed["html"], offset=0)
     first = records[0]
-    assert first["title"] == "助人为乐！"
     assert first["list_date"] == "2011-02-08"
-    assert first["tags"] == ["旧文", "2011"]
+    assert first["tags"] == ["空间"]
     assert "截断" in first["list_desc"]
     assert first["detail_url"].endswith("/page/view?key=aaaabbbbccccdddd-1111111111")
+
+
+def test_parse_list_html_prefers_untruncated_title(list_response):
+    """回归：列表项里标题出现两次，.unit-c 里的 a._photoLink 是缩略版。
+    早期实现取了缩略版，导致标题被静默截断。"""
+    parsed = parse_list_json(list_response)
+    first = parse_list_html(parsed["html"], offset=0)[0]
+    assert first["title"] == "关于旧文标题的完整版本，这一段在缩略版里会被截断"
+    assert not first["title"].endswith("这一段在")
+
+
+def test_parse_list_html_tags_come_from_spans(list_response):
+    """回归：真实结构是 <div class="tags"><span>…</span></div>，
+    早期只选了 a 标签，结果标签全部丢失。"""
+    parsed = parse_list_json(list_response)
+    records = parse_list_html(parsed["html"], offset=0)
+    assert records[0]["tags"] == ["空间"]
+    assert records[1]["tags"] == ["收藏"]
+    assert records[2]["tags"] == []
+
+
+def test_parse_list_html_tags_exclude_action_buttons(list_response):
+    """「编辑」「删除」按钮同样用 span，绝不能混进标签。"""
+    parsed = parse_list_json(list_response)
+    for record in parse_list_html(parsed["html"], offset=0):
+        assert "编辑" not in record["tags"]
+        assert "删除" not in record["tags"]
+
+
+def test_parse_list_html_captures_list_source(list_response):
+    """.page-url 在列表层就给出来源，与正文 footer 的来源各存一份。"""
+    parsed = parse_list_json(list_response)
+    records = parse_list_html(parsed["html"], offset=0)
+    assert records[0]["list_source"] == "来自于百度空间"
+    assert records[1]["list_source"] == "来自于百度知道"
+
+
+def test_parse_list_html_ignores_placeholder_external_url(list_response):
+    """回归：百度空间条目的外层 h4 带 href="http://1" 占位符，
+    早期被当成真实外链记录进档案。"""
+    parsed = parse_list_json(list_response)
+    records = parse_list_html(parsed["html"], offset=0)
+    assert records[0]["external_url"] is None
+    assert records[2]["external_url"] is None
 
 
 def test_parse_list_html_external_url(list_response):
@@ -137,7 +180,7 @@ def test_parse_content_uses_prefix_not_hardcoded_hash(content_page):
     """fixture 里的哈希段是 zzzzhashzzzz，与真实值不同 —— 前缀匹配必须仍然命中。"""
     parsed = parse_content_html(content_page)
     assert parsed["has_container"] is True
-    assert parsed["title"] == "助人为乐！"
+    assert parsed["title"] == "示例文章标题"
     assert parsed["content_date"] == "2011-02-08"
     assert parsed["source"] == "来自于百度空间"
 

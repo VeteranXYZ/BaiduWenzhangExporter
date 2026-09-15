@@ -39,11 +39,11 @@ def test_write_atomic_replaces_existing(tmp_path):
 
 def test_json_is_utf8_without_ascii_escapes(tmp_path):
     target = tmp_path / "x.json"
-    write_json_atomic(target, {"标题": "助人为乐！"})
+    write_json_atomic(target, {"标题": "示例文章标题"})
     raw = target.read_text(encoding="utf-8")
-    assert "助人为乐" in raw          # 中文必须可直接阅读
+    assert "示例文章标题" in raw          # 中文必须可直接阅读
     assert "\\u" not in raw
-    assert json.loads(raw)["标题"] == "助人为乐！"
+    assert json.loads(raw)["标题"] == "示例文章标题"
 
 
 def test_read_json_missing_returns_default(tmp_path):

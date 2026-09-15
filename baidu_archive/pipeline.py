@@ -151,6 +151,7 @@ def export_master_index(config: Config, state: ArchiveState) -> None:
                 "list_date_text": row["list_date_text"],
                 "tags": json.loads(row["tags_json"] or "[]"),
                 "list_desc": row["list_desc"],
+                "list_source": row["list_source"],
                 "detail_url": row["detail_url"],
                 "external_url": row["external_url"],
                 "list_offset": row["list_offset"],
@@ -163,8 +164,8 @@ def export_master_index(config: Config, state: ArchiveState) -> None:
 
     csv_path = config.root / "master_index.csv"
     columns = [
-        "global_position", "key", "type", "title", "list_date",
-        "tags", "list_offset", "position_in_page", "detail_url", "external_url", "list_desc",
+        "global_position", "key", "type", "title", "list_date", "tags", "list_source",
+        "list_offset", "position_in_page", "detail_url", "external_url", "list_desc",
     ]
     lines = []
     import io
@@ -443,7 +444,10 @@ def run_parse(
             "content_date": parsed["content_date"],
             "content_date_text": parsed["content_date_text"],
             "tags": _json.loads(record.get("tags_json") or "[]"),
-            "source": parsed["source"],
+            # 列表来源与正文 footer 来源各存一份，不擅自判断谁"正确"
+            "source": parsed["source"] or record.get("list_source"),
+            "content_source": parsed["source"],
+            "list_source": record.get("list_source"),
             "list_desc": record.get("list_desc"),
             "detail_url": record.get("detail_url"),
             "external_url": record.get("external_url"),

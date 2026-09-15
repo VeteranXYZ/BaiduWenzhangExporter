@@ -80,9 +80,9 @@ def test_safe_key_dirname_hostile_key():
 
 
 def test_readable_dirname():
-    out = readable_dirname("2011-02-08", "助人为乐！", "aaaabbbb-111")
+    out = readable_dirname("2011-02-08", "示例文章标题", "aaaabbbb-111")
     assert out.startswith("2011-02-08_")
-    assert "助人为乐" in out
+    assert "示例文章标题" in out
 
 
 # ---------------- 扩展名 ----------------

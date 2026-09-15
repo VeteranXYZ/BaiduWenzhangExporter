@@ -126,6 +126,48 @@ def _first_text(li, selectors: Iterable[str]) -> str | None:
     return None
 
 
+# 列表项里标题出现两次：.mask 里的 h4.article-h4 是完整标题，
+# .unit-c 里的 a._photoLink 是缩略版（实测会在 ~20 个全角字符处截断）。
+# 两处都可能缺失，所以取所有候选中最长的那个，而不是按固定优先级。
+_TITLE_SELECTORS = (
+    ".mask h4.article-h4 a",
+    ".mask h4.article-h4",
+    ".unit-c h4 a",
+    "a._photoLink",
+    ".title",
+    "h3",
+    "h2",
+)
+
+
+def _extract_title(li) -> str | None:
+    candidates: list[str] = []
+    for selector in _TITLE_SELECTORS:
+        for node in li.select(selector):
+            text = node.get_text(" ", strip=True)
+            if text:
+                candidates.append(text)
+    if not candidates:
+        anchor = li.find("a", href=re.compile(r"/(page|article)/view"))
+        if anchor:
+            text = anchor.get_text(" ", strip=True) or anchor.get("title") or ""
+            if text.strip():
+                candidates.append(text.strip())
+    if not candidates:
+        return None
+    return max(candidates, key=len)
+
+
+def _is_meaningful_external(url: str) -> bool:
+    """列表项的 h4 里常带 ``href="http://1"`` 这种占位符，不能当外链记录。"""
+    host = domain_of(url)
+    if not host or "." not in host:
+        return False
+    if host.replace(".", "").isdigit() and not re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", host):
+        return False
+    return True
+
+
 _DATE_PATTERN = re.compile(r"(\d{4})\s*[年./\-]\s*(\d{1,2})\s*[月./\-]\s*(\d{1,2})")
 
 
@@ -171,27 +213,26 @@ def parse_list_html(html: str, *, offset: int = 0, site_root: str = "https://wen
             path = urlparse(absolute).path
             if "/page/view" in path or "/article/view" in path:
                 detail_href = detail_href or absolute
-            elif url_scheme_kind(absolute) == "http" and domain_of(absolute) not in {
-                "wenzhang.baidu.com",
-                "",
-            }:
+            elif (
+                url_scheme_kind(absolute) == "http"
+                and domain_of(absolute) != "wenzhang.baidu.com"
+                and _is_meaningful_external(absolute)
+            ):
                 external_url = external_url or absolute
 
-        tags = [
-            t.get_text(" ", strip=True)
-            for t in li.select(".tag, .tags a, .tag-item, a.tag")
-            if t.get_text(strip=True)
-        ]
+        # 实测结构为 <div class="tags _tags"><span>空间</span></div> —— 标签在 span 里。
+        # 「编辑」「删除」按钮的 span 位于 .edit-tag-btn/.del-btn 内，不会被 .tags span 命中。
+        tags: list[str] = []
+        for node in li.select(".tags span, .tags a, .tag, .tag-item, a.tag"):
+            text = node.get_text(" ", strip=True)
+            if text and text not in tags:
+                tags.append(text)
 
-        title = _first_text(
-            li, (".title", "h3", "h2", ".unit-title", "a.title", ".name")
-        )
-        if not title and detail_href:
-            anchor = li.find("a", href=re.compile(r"/(page|article)/view"))
-            if anchor:
-                title = anchor.get_text(" ", strip=True) or anchor.get("title")
+        title = _extract_title(li)
         date_text = _first_text(li, (".date", ".time", ".time-cang", ".create-time", ".unit-date"))
-        desc = _first_text(li, (".desc", ".summary", ".abstract", ".content"))
+        desc = _first_text(li, (".desc", ".summary", ".abstract"))
+        # .page-url 在列表层就给出来源（例如「来自于百度空间」），与正文 footer 的来源各存一份
+        source = _first_text(li, (".page-url", ".source", ".from"))
 
         records.append(
             {
@@ -202,6 +243,7 @@ def parse_list_html(html: str, *, offset: int = 0, site_root: str = "https://wen
                 "list_date": normalize_date(date_text),
                 "tags": tags,
                 "list_desc": desc,
+                "list_source": source,
                 "detail_url": detail_href,
                 "external_url": external_url,
                 "list_offset": offset,

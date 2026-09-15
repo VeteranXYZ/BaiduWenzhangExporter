@@ -133,7 +133,7 @@ def test_export_wxr_escapes_cdata(seeded):
     path = export_wxr(config, state)
     xml = path.read_text(encoding="utf-8")
     assert "<wp:wxr_version>1.2</wp:wxr_version>" in xml
-    assert "助人为乐" in xml
+    assert "示例文章标题" in xml
     assert "_archive_key" in xml
     # 原脚本用 ]]&gt; 会破坏正文；正确做法是拆分 CDATA
     assert "]]&gt;" not in xml
@@ -146,13 +146,13 @@ def test_export_site_is_browsable_offline(seeded):
     count = export_site(config, state, site)
     assert count == 1
     index = (site / "index.html").read_text(encoding="utf-8")
-    assert "助人为乐" in index
+    assert "示例文章标题" in index
     assert "2011" in index                       # 按年份分组
     assert (site / "style.css").exists()
     articles = list((site / "articles").iterdir())
     assert len(articles) == 1
     page = (articles[0] / "index.html").read_text(encoding="utf-8")
-    assert "助人为乐" in page and "返回目录" in page
+    assert "示例文章标题" in page and "返回目录" in page
 
 
 def test_master_index_preserves_original_order(seeded):
@@ -163,7 +163,8 @@ def test_master_index_preserves_original_order(seeded):
     assert index[0]["key"] == key
     csv_text = (config.root / "master_index.csv").read_text(encoding="utf-8")
     assert csv_text.startswith("﻿")          # Excel 友好
-    assert "助人为乐" in csv_text
+    assert "完整版本" in csv_text
+    assert "来自于百度空间" in csv_text   # list_source 也要进 CSV
 
 
 def test_master_index_includes_non_page_types(seeded):

@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS records (
     list_date_text   TEXT,
     tags_json        TEXT,
     list_desc        TEXT,
+    list_source      TEXT,
     detail_url       TEXT,
     external_url     TEXT,
     list_offset      INTEGER,
@@ -139,7 +140,19 @@ class ArchiveState:
         self._conn.execute("PRAGMA foreign_keys=ON")
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    # 归档工具不能因为加了一列就让已有 state.db 作废，故做幂等的补列迁移。
+    _MIGRATIONS = (("records", "list_source", "TEXT"),)
+
+    def _migrate(self) -> None:
+        for table, column, coltype in self._MIGRATIONS:
+            existing = {
+                row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
     def close(self) -> None:
         with self._lock:
@@ -186,9 +199,9 @@ class ArchiveState:
             conn.execute(
                 """
                 INSERT INTO records(key,type,title,list_date,list_date_text,tags_json,list_desc,
-                                    detail_url,external_url,list_offset,position_in_page,
+                                    list_source,detail_url,external_url,list_offset,position_in_page,
                                     global_position,raw_html,li_attrs_json,first_seen_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(key) DO UPDATE SET
                     type=excluded.type,
                     title=COALESCE(excluded.title, records.title),
@@ -196,6 +209,7 @@ class ArchiveState:
                     list_date_text=COALESCE(excluded.list_date_text, records.list_date_text),
                     tags_json=excluded.tags_json,
                     list_desc=COALESCE(excluded.list_desc, records.list_desc),
+                    list_source=COALESCE(excluded.list_source, records.list_source),
                     detail_url=COALESCE(excluded.detail_url, records.detail_url),
                     external_url=COALESCE(excluded.external_url, records.external_url),
                     list_offset=excluded.list_offset,
@@ -212,6 +226,7 @@ class ArchiveState:
                     record.get("list_date_text"),
                     json.dumps(record.get("tags") or [], ensure_ascii=False),
                     record.get("list_desc"),
+                    record.get("list_source"),
                     record.get("detail_url"),
                     record.get("external_url"),
                     record.get("list_offset"),
