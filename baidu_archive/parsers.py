@@ -338,6 +338,21 @@ def parse_content_html(html: str) -> dict[str, Any]:
     time_text = time_node.get_text(" ", strip=True) if time_node else None
     source = source_node.get_text(" ", strip=True) if source_node else None
 
+    # 正文页也带标签，位于 .pcs-article-toos_* > .tags-list > ul > li
+    content_tags = [
+        node.get_text(" ", strip=True)
+        for node in soup.select(".tags-list li, .tags-list a")
+        if node.get_text(strip=True)
+    ]
+    # .note 是用户给收藏加的备注，通常为空但不能因此不采集
+    note_node = soup.select_one(".note")
+    note = note_node.get_text(" ", strip=True) if note_node else None
+
+    # 正文页声明了 <base href="http://1">，是个占位符。
+    # 浏览器会用它解析相对 URL，我们绝不采信 —— 只记录下来供日后追溯。
+    base_node = soup.find("base", href=True)
+    base_href = base_node["href"].strip() if base_node else None
+
     text = ""
     if content_node:
         text = content_node.get_text("\n", strip=True)
@@ -345,6 +360,9 @@ def parse_content_html(html: str) -> dict[str, Any]:
     page_title_tag = soup.find("title")
     return {
         "title": title,
+        "content_tags": content_tags,
+        "note": note,
+        "base_href": base_href,
         "content_html": content_html,
         "content_text": text,
         "content_length": len(text),

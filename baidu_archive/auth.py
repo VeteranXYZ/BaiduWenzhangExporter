@@ -175,6 +175,10 @@ def build_list_url_template(url: str) -> str:
         elif lowered in {"limit", "rn", "num", "count", "page_size"}:
             rebuilt.append((name, "__LIMIT__"))
             saw_limit = True
+        elif lowered in {"_", "_t", "t", "timestamp", "rand", "r"} and value.isdigit():
+            # 缓存穿透参数：冻结成抓取当时的值会让 17 个分页请求带同一个"随机"值，
+            # 既可能命中缓存也显得可疑。改成每次请求现取。
+            rebuilt.append((name, "__TS__"))
         else:
             rebuilt.append((name, value))
     if not saw_start:
@@ -183,7 +187,11 @@ def build_list_url_template(url: str) -> str:
         rebuilt.append(("limit", "__LIMIT__"))
     query = urlencode(rebuilt)
     template = urlunparse(parts._replace(query=query))
-    return template.replace("__START__", "{start}").replace("__LIMIT__", "{limit}")
+    return (
+        template.replace("__START__", "{start}")
+        .replace("__LIMIT__", "{limit}")
+        .replace("__TS__", "{ts}")
+    )
 
 
 def import_curl(curl_text: str, *, secrets_dir: Path = SECRETS_DIR) -> dict:

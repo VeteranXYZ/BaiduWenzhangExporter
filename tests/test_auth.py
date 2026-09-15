@@ -90,3 +90,20 @@ def test_load_credentials_absent_is_not_an_error(tmp_path, monkeypatch):
     creds = load_credentials(secrets_dir=tmp_path)
     assert creds.present is False
     assert creds.source == "none"
+
+
+def test_build_list_url_template_real_endpoint():
+    """实测端点：/fav/list?start&limit&wd&type&getListHtml&_"""
+    real = "https://wenzhang.baidu.com/fav/list?start=100&limit=30&wd=&type=&getListHtml=1&_=1789506449173"
+    template = build_list_url_template(real)
+    assert "{start}" in template and "{limit}" in template and "{ts}" in template
+    assert "getListHtml=1" in template          # 非分页参数原样保留
+    assert "wd=" in template and "type=" in template
+    assert "1789506449173" not in template      # 缓存穿透值不得被冻结
+
+
+def test_build_list_url_template_only_digit_cachebusters():
+    """名为 t 但值不是数字的参数不能被误当成缓存穿透参数。"""
+    template = build_list_url_template("https://x.com/a?t=abc&start=0&limit=30")
+    assert "t=abc" in template
+    assert "{ts}" not in template

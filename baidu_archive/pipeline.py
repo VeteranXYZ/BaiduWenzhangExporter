@@ -443,7 +443,12 @@ def run_parse(
             "list_date_text": record.get("list_date_text"),
             "content_date": parsed["content_date"],
             "content_date_text": parsed["content_date_text"],
+            # 列表标签与正文页标签各存一份；正文页还带用户备注 note
             "tags": _json.loads(record.get("tags_json") or "[]"),
+            "content_tags": parsed.get("content_tags") or [],
+            "note": parsed.get("note"),
+            # 正文页声明 <base href="http://1">，是占位符，仅记录不采信
+            "content_base_href": parsed.get("base_href"),
             # 列表来源与正文 footer 来源各存一份，不擅自判断谁"正确"
             "source": parsed["source"] or record.get("list_source"),
             "content_source": parsed["source"],

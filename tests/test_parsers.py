@@ -248,3 +248,51 @@ def test_looks_like_login_page(login_page, content_page):
     assert looks_like_login_page(login_page) is True
     assert looks_like_login_page(content_page) is False
     assert looks_like_login_page("") is False
+
+
+# ---------------- 正文页：真实结构补充项 ----------------
+
+def test_parse_content_collects_content_tags(content_page):
+    """正文页 .tags-list > li 也带标签，与列表标签各存一份。"""
+    parsed = parse_content_html(content_page)
+    assert parsed["content_tags"] == ["空间", "旧文"]
+
+
+def test_parse_content_collects_note(content_page):
+    """.note 是收藏备注，通常为空但不能因此不采集。"""
+    assert parse_content_html(content_page)["note"] == "这是收藏时写的备注"
+
+
+def test_parse_content_records_but_does_not_trust_base_href(content_page):
+    """正文页声明 <base href="http://1">，是占位符。
+
+    记录下来供追溯，但解析相对 URL 时绝不采信 —— 否则所有相对图片都会
+    指向 http://1 这个不存在的主机。
+    """
+    parsed = parse_content_html(content_page)
+    assert parsed["base_href"] == "http://1"
+    assets = extract_assets(
+        parsed["content_html"], base_url="https://wenzhang.bdstatic.com/page/content/?key=K"
+    )
+    relative = [a for a in assets if "relative/path.jpg" in a["original_url"]]
+    assert len(relative) == 1
+    assert relative[0]["resolved_url"] == "https://wenzhang.bdstatic.com/relative/path.jpg"
+    assert "http://1" not in (relative[0]["resolved_url"] or "")
+
+
+def test_extract_assets_excludes_footer_complaint_links(content_page):
+    """投诉区有 qingting.baidu.com 链接和一个 POST 表单，都在正文容器之外。
+
+    资源扫描只作用于正文容器的 inner HTML，绝不能把这些 UI 元素当成文章资源。
+    """
+    parsed = parse_content_html(content_page)
+    assets = extract_assets(parsed["content_html"])
+    assert not any("qingting" in (a["original_url"] or "") for a in assets)
+    assert not any("add/ask" in (a["original_url"] or "") for a in assets)
+
+
+def test_parse_content_page_title_is_generic_not_article_title(content_page):
+    """正文页 <title> 是「百度网盘 文章」，不能拿它当文章标题。"""
+    parsed = parse_content_html(content_page)
+    assert parsed["page_title"] != parsed["title"]
+    assert parsed["title"] == "示例文章标题"

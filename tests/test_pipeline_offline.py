@@ -123,7 +123,7 @@ def test_export_md_txt(seeded):
     item_dir = config.item_dir(key)
     markdown = (item_dir / "content.md").read_text(encoding="utf-8")
     text = (item_dir / "content.txt").read_text(encoding="utf-8")
-    assert "助了一位老人" in markdown or "帮了一位老人" in markdown
+    assert "第一段正文" in markdown
     assert "人人网主页" in text
 
 
@@ -213,3 +213,22 @@ def test_verify_status_counts_are_mutually_exclusive(seeded):
     total_status = sum(pages.get(name, 0) for name in exclusive)
     assert total_status == pages["total"], f"状态分布合计 {total_status} != 总计 {pages['total']}"
     assert pages["parsed"] <= pages["total"]
+
+
+def test_metadata_keeps_both_tag_sources_and_note(seeded):
+    """列表标签与正文标签各存一份，备注也要保留。"""
+    config, state, key = seeded
+    run_parse(config, state)
+    metadata = json.loads((config.item_dir(key) / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["tags"] == ["空间"]                      # 来自列表
+    assert metadata["content_tags"] == ["空间", "旧文"]       # 来自正文页
+    assert metadata["note"] == "这是收藏时写的备注"
+    assert metadata["content_base_href"] == "http://1"       # 记录但不采信
+
+
+def test_metadata_keeps_both_sources(seeded):
+    config, state, key = seeded
+    run_parse(config, state)
+    metadata = json.loads((config.item_dir(key) / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["list_source"] == "来自于百度空间"
+    assert metadata["content_source"] == "来自于百度空间"

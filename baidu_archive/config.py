@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
@@ -19,12 +20,12 @@ SITE_ROOT = "https://wenzhang.baidu.com"
 
 # 列表接口的确切 URL 是本项目唯一的未知量。
 # 首选来源是 ``import-curl``（从 DevTools 实际请求捕获）；这里的候选仅用于 doctor 自动探测。
+# 第一条是 2026-09 实测确认可用的端点（wd/type 为搜索与类型筛选，留空即全部；
+# _ 是缓存穿透参数，每次请求现取）。其余仅作兜底探测。
 LIST_URL_CANDIDATES = (
+    f"{SITE_ROOT}/fav/list?start={{start}}&limit={{limit}}&wd=&type=&getListHtml=1&_={{ts}}",
     f"{SITE_ROOT}/api/getlist?start={{start}}&limit={{limit}}",
     f"{SITE_ROOT}/page/getlist?start={{start}}&limit={{limit}}",
-    f"{SITE_ROOT}/home/getlist?start={{start}}&limit={{limit}}",
-    f"{SITE_ROOT}/api/list?start={{start}}&limit={{limit}}",
-    f"{SITE_ROOT}/getlist?start={{start}}&limit={{limit}}",
 )
 
 DETAIL_URL_TEMPLATE = f"{SITE_ROOT}/page/view?key={{key}}"
@@ -124,7 +125,10 @@ class Config:
                 "列表接口 URL 未配置。请先运行 `baidu-archive import-curl <file>` 导入，"
                 "或用 `baidu-archive doctor --probe` 自动探测。"
             )
-        return self.list_url_template.format(start=start, limit=limit or self.page_limit)
+        # ts 始终提供：模板里没有 {ts} 时 format 会忽略它
+        return self.list_url_template.format(
+            start=start, limit=limit or self.page_limit, ts=int(time.time() * 1000)
+        )
 
     def to_dict(self) -> dict:
         data = asdict(self)
