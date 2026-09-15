@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "baidu-archive"
+version = "0.1.0"
+description = "百度空间历史内容抢救 / 归档工具：RAW-first、可恢复、可验证的本地数字档案"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    "markdownify>=0.13",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+baidu-archive = "baidu_archive.cli:main"
+
+[tool.setuptools]
+packages = ["baidu_archive"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

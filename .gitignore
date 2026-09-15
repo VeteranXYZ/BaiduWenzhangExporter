@@ -1,4 +1,12 @@
-# Security-sensitive local files
+# ===== 凭证 / 敏感数据（绝不入库）=====
+secrets/
+cookies.txt
+cookies.json
+cookies*.txt
+cookies*.json
+*.cookies
+session.json
+*curl*.txt
 .env
 .env.*
 !.env.example
@@ -9,8 +17,42 @@
 *.pfx
 credentials.json
 service-account*.json
+# 可能含 token/sign 的调试输出
+*.har
+debug*.json
+debug*.html
+response*.json
+dump*.html
+
+# ===== 归档产物（本人私人历史数据）=====
+archive/
+site/
 *.sqlite
 *.sqlite3
 *.db
+*.db-wal
+*.db-shm
+config.json
+
+# 旧版脚本的输出
+baidu_articles_RAW.csv
+baidu_articles_SORTED.csv
+baidu_wordpress_import_FINAL.xml
+wordpress_import.xml
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# ===== 杂项 =====
+.DS_Store
 *.bak
 backup*

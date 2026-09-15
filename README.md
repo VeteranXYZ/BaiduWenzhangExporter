@@ -1,243 +1,264 @@
 # BaiduWenzhangExporter
 
-百度文章迁移工具。用于将百度文章（原百度空间/百度文章）批量抓取、清洗、排序，并导出为 WordPress 可直接导入的 WXR 文件。
+百度空间 / 百度文章历史内容的**本地数字档案工具**。
 
-这个脚本来自实际迁移需求：百度文章列表需要登录后访问，正文存在 iframe、展开全文、懒加载图片、冗余 HTML、时间排序和中途失败等问题。`BaiduExporter.py` 把浏览器抓取、断点续传、内容清洗、时间排序和 WordPress 打包整合在一个脚本里。
+目标不是"做一个爬虫"，而是在旧服务彻底关闭之前，把仍然能访问的个人历史内容
+**尽快、完整、可验证、尽可能原样**地抢救到本地。
 
-## 功能
+核心特性：
 
-- 自动打开 Chrome 并等待用户登录百度账号
-- 使用 `webdriver-manager` 自动安装/匹配 ChromeDriver
-- 深度滚动文章列表，收集所有文章链接
-- 逐篇进入文章 iframe 抓取标题、正文、发布时间和原始 URL
-- 自动点击“阅读全文 / 展开全文”
-- 三段式滚动触发懒加载图片
-- 清洗百度冗余 HTML，保留正文结构
-- 实时写入 `baidu_articles_RAW.csv`，支持断点续传
-- 生成按发布时间倒序排列的 `baidu_articles_SORTED.csv`
-- 生成 WordPress WXR 导入文件 `baidu_wordpress_import_FINAL.xml`
-- 为文章添加 WordPress 分类 `百度文章`
-- 保留原始百度文章 URL 到 `_original_url` 自定义字段
+| | |
+|---|---|
+| **RAW FIRST** | 每个网络响应先原样落盘，再解析。解析器有 bug 也能离线重建，无需再访问百度 |
+| **可恢复** | 任意阶段中断后重跑即续传，已完成的内容永不重复下载 |
+| **可验证** | 自动核对 API `totalCount` 与实际归档数，明确告诉你"到底有没有漏" |
+| **保留原始** | 正文原始 HTML 永不修改；失效的图片/外链 URL 一律保留，不删元素 |
+| **只读** | 只发 GET。不删除、不编辑、不修改百度服务器上的任何内容 |
+| **保守** | 默认并发 2、间隔 0.8s，面对遗留系统可靠性优先于速度 |
 
-## 文件结构
+> 仓库中另有 [`BaiduExporter.py`](BaiduExporter.py)（Selenium + CSV + WordPress WXR），
+> 是本工具的前身，文档见 [README.legacy.md](README.legacy.md)。新工具已内置 WXR 导出。
 
-```text
-BaiduWenzhangExporter/
-  BaiduExporter.py
-  baidu_articles_RAW.csv
-  baidu_articles_SORTED.csv
-  baidu_wordpress_import_FINAL.xml
-```
+---
 
-说明：
+## 安装
 
-- `BaiduExporter.py`：主程序，负责抓取、清洗、排序和导出。
-- `baidu_articles_RAW.csv`：实时抓取备份。每成功抓取一篇就写入一次，是断点续传依据。
-- `baidu_articles_SORTED.csv`：最终清洗并按发布时间倒序排列的 CSV 备份。
-- `baidu_wordpress_import_FINAL.xml`：最终 WordPress WXR 导入文件。
-
-后三个文件由脚本运行后自动生成。
-
-## 环境要求
-
-- Python 3.8+
-- Google Chrome
-- 可访问百度文章页面的百度账号
-- 稳定网络环境
-
-安装依赖：
+需要 Python 3.9+（开发环境为 3.14）。
 
 ```bash
-pip install selenium beautifulsoup4 webdriver-manager
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
-## 使用方法
+依赖只有四个：`httpx`、`beautifulsoup4`、`lxml`、`markdownify`。
 
-运行脚本：
+运行方式二选一：
 
 ```bash
-python BaiduExporter.py
+.venv/bin/python -m baidu_archive <命令>
 ```
 
-执行流程：
-
-1. 脚本会自动启动 Chrome，并打开百度文章首页。
-2. 在浏览器中手动登录百度账号。
-3. 登录后进入「我的文章」列表页面。
-4. 回到终端，按下回车。
-5. 脚本开始自动扫描列表、抓取文章、清洗内容并实时写入 CSV。
-6. 抓取结束后，脚本会自动生成排序后的 CSV 和 WordPress WXR 文件。
-
-脚本启动 Chrome 时使用 `eager` 页面加载策略：HTML 主体加载完成后就开始执行，不等待所有图片资源完全加载。单篇文章内部会再通过滚动触发懒加载图片。
-
-## 导入 WordPress
-
-1. 登录 WordPress 后台。
-2. 进入 `工具` -> `导入`。
-3. 找到 `WordPress` 导入器。
-4. 上传 `baidu_wordpress_import_FINAL.xml`。
-5. 分配作者并开始导入。
-
-导入后，文章会以 `post` 类型发布，并自动归入 `百度文章` 分类。
-
-WXR 中的默认作者为 `admin`。如果你的 WordPress 站点没有这个作者，导入器会让你重新分配作者。
-
-## 输出文件
-
-### `baidu_articles_RAW.csv`
-
-实时写入的原始抓取结果。字段包括：
-
-- 标题
-- 文章内容
-- 发布时间
-- 原始URL
-
-如果脚本中途停止，再次运行时会读取这个文件，跳过已抓取过的文章。
-
-### `baidu_articles_SORTED.csv`
-
-最终排序后的 CSV。脚本会按发布时间倒序排列文章，方便检查和备份。
-
-### `baidu_wordpress_import_FINAL.xml`
-
-WordPress WXR 文件，可直接通过 WordPress 官方导入器导入。
-
-生成规则：
-
-- `wp:post_type` 为 `post`
-- `wp:status` 为 `publish`
-- 分类为 `百度文章`
-- 原始 URL 写入 `_original_url`
-- 正文写入 `content:encoded`
-- 标题和正文使用 CDATA 包裹
-- slug 从标题生成，最长保留 50 个字符；如果标题无法生成 slug，则使用 `post-{序号}`
-
-## 断点续传
-
-脚本采用实时追加写入方式。每成功抓取一篇文章，就会立即写入 `baidu_articles_RAW.csv` 并 flush 到磁盘。
-
-如果出现以下情况：
-
-- 网络中断
-- 电脑卡死
-- Chrome 崩溃
-- 手动 `Ctrl+C` 停止脚本
-
-可以直接重新运行：
+或装成命令：
 
 ```bash
-python BaiduExporter.py
+.venv/bin/python -m pip install -e .
+baidu-archive <命令>
 ```
 
-脚本会读取已有的 `baidu_articles_RAW.csv`，自动跳过已经抓取过的 URL，只继续处理剩余文章。
+---
 
-断点判断依据是 `原始URL` 字段。只要某篇文章已经写入 `baidu_articles_RAW.csv`，再次运行时就不会重复抓取。
+## 提供 Cookie
 
-## 内容处理
+归档的是**你本人账号**的历史数据，因此需要登录态。
+凭证只保存在本地 `secrets/`（已被 `.gitignore` 覆盖），**永不写入日志、报告或源码**。
 
-脚本会对百度文章正文做基础清洗：
+### 方式 A：从 DevTools 导入（推荐）
 
-- 定位百度文章正文容器
-- 移除空 `div` / `p`
-- 保留正文段落、图片和基础 HTML 结构
-- 将纯文本换行转换为 `<br>`
-- 压缩过多连续换行
-- 使用 CDATA 包裹正文写入 WXR，减少 WordPress 导入时的转义问题
+这一步同时解决凭证和"列表接口 URL 到底是什么"两个问题。
 
-如果脚本找不到正文容器，会写入 `<p>无内容</p>` 作为占位内容。
+1. 浏览器登录百度，打开你的文章/收藏列表页
+2. F12 → **Network** → 筛选 **Fetch/XHR**
+3. 向下滚动列表，触发翻页请求
+4. 找到返回 JSON（含 `totalCount`）的那条请求，**右键 → Copy → Copy as cURL**
+5. 粘贴到一个文件里，例如 `list.curl.txt`
+6. 导入：
 
-## 抓取逻辑
+```bash
+.venv/bin/python -m baidu_archive import-curl list.curl.txt
+```
 
-脚本主要分为三个阶段。
+导入结果会显示 Cookie 名称与打码后的 URL 模板，不会回显任何真实值。
 
-### 1. 扫描列表
+### 方式 B：环境变量
 
-在「我的文章」列表页中，脚本会持续滚动页面，直到页面高度连续多次不再变化。随后读取 `li.unit[id^="key_"]` 元素，并根据元素 class 判断文章链接类型：
+```bash
+export BAIDU_ARCHIVE_COOKIE='BDUSS=...; STOKEN=...'
+```
 
-- class 中包含 `article` -> `https://wenzhang.baidu.com/article/view?key=...`
-- 否则 -> `https://wenzhang.baidu.com/page/view?key=...`
+### 方式 C：Cookie 文件
 
-### 2. 抓取单篇
+把完整 Cookie header 串写入 `secrets/cookies.txt`；
+也支持浏览器扩展导出的 `secrets/cookies.json` 与 `secrets/cookies.netscape.txt`。
 
-每篇文章会按以下顺序处理：
+> 用方式 B / C 时，列表接口 URL 需要单独写进 `config.json`：
+> ```json
+> { "list_url_template": "https://.../getlist?start={start}&limit={limit}" }
+> ```
+> 也可以让 `doctor --probe` 尝试自动探测。
 
-1. 打开文章 URL。
-2. 进入 `iframe.pcs-article-iframe`。
-3. 等待 body 出现。
-4. 尝试点击 `阅读全文`、`展开全文` 或 `展开`。
-5. 滚动到 33%、66%、100% 位置，触发懒加载内容。
-6. 解析标题、发布时间、正文。
-7. 清洗正文 HTML。
-8. 返回主页面上下文。
+---
 
-如果单篇抓取失败，脚本会打印错误并跳过该链接，继续处理下一篇。
+## 快速开始
 
-### 3. 打包输出
+```bash
+# 1. 体检：确认凭证有效、端点可达
+.venv/bin/python -m baidu_archive doctor
 
-抓取结束后，脚本会读取 `baidu_articles_RAW.csv`：
+# 2. 最小链路验证（只抓 1 篇，不碰全量）
+.venv/bin/python -m baidu_archive dry-run
 
-1. 过滤有发布时间的记录。
-2. 按发布时间倒序排序。
-3. 写入 `baidu_articles_SORTED.csv`。
-4. 生成 WordPress WXR 文件。
+# 3. 确认无误后，全量归档
+.venv/bin/python -m baidu_archive all
 
-如果某篇文章的日期无法解析，会按 `1970-01-01` 处理，避免排序和导出中断。
+# 4. 看报告
+.venv/bin/python -m baidu_archive verify
+```
 
-## 注意事项
+**务必先 `dry-run` 再 `all`**。dry-run 会依次验证：
+列表接口 → `totalCount` → 解析记录 → 取一条 key → 详情页 → iframe → 正文 → 资源发现。
 
-- 抓取前必须手动登录百度账号。
-- 请确保已经进入「我的文章」列表页后再回到终端按回车。
-- 抓取过程中不要手动关闭 Chrome。
-- 如果百度页面结构变化，选择器可能需要调整。
-- 单篇文章抓取失败时会跳过，不会终止整个任务。
-- 日期解析失败时会使用 `1970-01-01` 作为兜底日期。
-- 图片仍然引用百度原始地址，导入 WordPress 后可能遇到防盗链问题。
+指定某一篇验证：
 
-图片防盗链的常见处理方式：
+```bash
+.venv/bin/python -m baidu_archive dry-run --key 0000000000000002-1000000002
+```
 
-1. 在 WordPress 安装 `Auto Upload Images` 等图片搬运插件。
-2. 导入或保存文章时，让插件自动把远程图片下载到自己的服务器。
-3. 导入完成后检查图片是否已本地化。
+---
 
-## 常见问题
+## 命令
 
-### 跑到一半中断怎么办？
+| 命令 | 作用 |
+|---|---|
+| `import-curl <文件>` | 从 DevTools cURL 导入端点与凭证 |
+| `doctor [--probe]` | 体检：配置 / 凭证 / 端点连通性 |
+| `dry-run [--key K]` | 最小链路验证，不全量抓 |
+| `index` | 翻完所有分页，建立**全部记录**的 master index |
+| `fetch` | 抓取详情页 + 正文页原始 HTML |
+| `parse` | 从 `raw/` 重建 metadata 与正文（**离线，不发请求**） |
+| `assets` | 下载图片等资源，生成 `content.local.html` |
+| `export` | 导出 `md` / `txt` / `wxr` / `site` |
+| `verify` | 完整性校验，生成报告 |
+| `retry-failed` | 只重试失败 / 警告 / 未完成的条目 |
+| `status` | 当前进度速览 |
+| `all` | 上述流水线一次跑完 |
 
-重新运行脚本即可。脚本会读取 `baidu_articles_RAW.csv`，自动跳过已抓取的文章。
+常用参数：`--root` `--concurrency` `--delay` `--force` `--limit` `--max-pages`
 
-### 导入 WordPress 后文章时间会乱吗？
+```bash
+# 只跑前 2 页，先看看效果
+.venv/bin/python -m baidu_archive index --max-pages 2
 
-不会。生成最终文件前，脚本会按发布时间倒序排序，并将发布时间写入 WXR。
+# 放慢速度
+.venv/bin/python -m baidu_archive --delay 2.0 --concurrency 1 fetch
 
-### 为什么有些图片导入后不显示？
+# 同时下载视频/音频（默认只下图片）
+.venv/bin/python -m baidu_archive assets --include-media
 
-通常是百度图片防盗链导致。建议使用 WordPress 图片搬运插件把远程图片保存到自己的服务器。
+# 导出全部格式
+.venv/bin/python -m baidu_archive export --format all
+```
 
-### 能不能重复运行？
+---
 
-可以。重复运行时会跳过 `baidu_articles_RAW.csv` 中已经存在的原始 URL。
+## 中断与恢复
 
-### 生成的 XML 是什么格式？
+**直接 Ctrl+C 即可**，无需任何清理。
 
-`baidu_wordpress_import_FINAL.xml` 是 WordPress WXR 格式，可通过 WordPress 官方导入器导入。
+所有文件写入都是原子的（临时文件 + `fsync` + `os.replace`），状态存在 SQLite 事务里，
+任何时刻断电都不会留下半个 JSON。
 
-### 为什么有些文章显示“无内容”？
+恢复就是**重新运行同一条命令**：
 
-通常是因为百度页面结构变化、正文容器未加载成功，或该文章页面本身异常。可以重新运行脚本，或针对新的页面结构调整正文选择器。
+```bash
+.venv/bin/python -m baidu_archive all
+```
 
-## 开发说明
+已完成的条目会显示 `[SKIP] already complete` 并被跳过。
 
-这个脚本最早由 Grok 根据迁移需求生成初版，后来又用 Codex 根据实际运行问题进行了多轮更新，逐步合并抓取、清洗、排序、断点续传和 WXR 导出流程。
+### 失败重试
 
-当前版本是单文件脚本，方便直接运行和备份。后续如果继续扩展，可以考虑拆分为：
+```bash
+.venv/bin/python -m baidu_archive retry-failed
+```
 
-- crawler
-- cleaner
-- exporter
-- checkpoint
-- WordPress WXR builder
+只处理 `failed` / `warning` / `pending` 状态的条目。
 
-## 更新时间
+### Cookie 失效
 
-2026/05
+工具会主动识别登录态失效 —— 不只看 HTTP 200，还检查响应是否为登录页、
+JSON 结构是否异常。**连续 5 条出现认证特征就立即停止整个任务**，
+避免把后面几百条污染成假失败。
+
+看到 `[AUTH] 连续 N 次请求出现认证失效特征` 时：重新导入 Cookie，再跑一次即可续传。
+
+---
+
+## 输出目录
+
+```
+archive/
+├── state.db                  SQLite 状态（可从 raw 完全重建）
+├── master_index.json         全部记录，保留列表原始顺序
+├── master_index.csv          同上，Excel 可直接打开
+├── crawl_state.json          进度快照
+│
+├── raw/                      ← 原始响应，只写一次，永不修改
+│   ├── lists/                列表接口 JSON（含 .meta.json 旁路元数据）
+│   ├── detail_pages/         /page/view 原始 HTML
+│   └── content_pages/        iframe 正文页原始 HTML
+│
+├── items/<key>/              ← 解析产物
+│   ├── metadata.json         标题、双份日期、标签、来源、资源清单、hash
+│   ├── content.original.html 正文原始 HTML（永不修改）
+│   ├── content.local.html    图片 src 重写为本地路径
+│   ├── content.md            Markdown
+│   ├── content.txt           纯文本（全文搜索用）
+│   ├── assets/               下载到本地的图片等
+│   └── asset_manifest.json   每个资源的 URL / 状态 / sha256 / 大小
+│
+├── reports/
+│   ├── summary.json / summary.md    完整性报告
+│   ├── failed_items.csv             需要关注的条目
+│   └── external_resources.csv       全部外链（含已失效的）
+│
+└── logs/archive-YYYYMMDD.log
+
+site/                         静态站点，百度关闭后仍可离线浏览
+├── index.html                按年份分组 + 标题搜索
+└── articles/<日期_标题_key>/
+```
+
+### 几个设计细节
+
+- **目录名用 `key`**，不用标题 —— 标题可能重复、超长、含非法字符。可读性由
+  `master_index.csv` 和静态站点承担。
+- **日期保存两份**：列表里的 `list_date` 和正文 footer 里的 `content_date`。
+  两者不同时**都保留**，不擅自判断谁正确。
+- **`totalCount` 是 504 条全部收藏**，不全是百度空间文章。`article`（如百度知道收藏）
+  等类型同样进 master index，只是第一阶段不抓正文。
+- **重复只报告不删除**：两个不同 key 即使正文相同，也可能代表不同的历史记录。
+
+---
+
+## 安全注意事项
+
+- **凭证**：只存 `secrets/`（`0600` 权限），已被 `.gitignore` 覆盖。
+  日志、报告、异常信息中的 URL 一律经 `redact_url()` 打码，`sign` / `expire` / `uid` / `token` 全部替换为 `<redacted>`。
+  完整签名 URL 只出现在本地 `metadata.json` 中，用于将来复原。
+- **不破解签名**：每次需要正文时，都从当前 `/page/view` 页面解析最新的 iframe `src`。
+  签名过期时自动回详情页重取，绝不自行计算 `sign`。
+- **不枚举、不越界**：只访问从你自己账号列表中实际取得的记录，不枚举 key、
+  不扫描其他用户、不递归抓取外站。外链只登记进 `external_resources.csv`。
+- **只读**：全程只发 GET，不调用任何 delete / edit / add 接口。
+- **测试 fixture 全部是脱敏构造数据**，不含任何真实 Cookie / bdstoken / sign / uid。
+
+---
+
+## 开发
+
+```bash
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest
+```
+
+解析逻辑与网络完全解耦，全部可离线单测（126 个测试，含端到端离线流水线）。
+
+架构与设计取舍见 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)。
+
+### 页面结构变了怎么办？
+
+所有选择器都用**前缀匹配**（`[id^="detailArticleContent_"]`），
+不硬编码百度的构建哈希（如 `_ptkaiapt4bxy_baiduscarticle`）—— 那串每次发版都会变。
+
+若百度仍然改版：改 `parsers.py` 后跑 `parse --force` 即可从已有 `raw/` 重建全部归档，
+**不需要重新访问百度**。这正是 RAW FIRST 的意义。
