@@ -266,6 +266,55 @@ def import_curl(curl_text: str, *, secrets_dir: Path = SECRETS_DIR) -> dict:
     }
 
 
+def save_cookie_session(
+    cookie_header: str,
+    *,
+    list_url_template: str | None = None,
+    user_agent: str | None = None,
+    referer: str | None = None,
+    secrets_dir: Path = SECRETS_DIR,
+) -> dict:
+    """把已拿到的 Cookie 写成会话文件（权限 0600）。返回脱敏摘要。
+
+    扫码登录走这条路：登录本身在浏览器窗口里由用户完成，程序只拿到结果
+    Cookie。与 import_curl 共用同一份落盘逻辑，凭证写入只有这一处。
+    """
+    cookie_header = (cookie_header or "").strip()
+    creds = Credentials(cookie_header=cookie_header)
+    if not creds.looks_logged_in():
+        raise AuthError("Cookie 中没有 BDUSS，不是有效的登录态")
+
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    existing = {}
+    path = secrets_dir / "session.json"
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+
+    session = {
+        # 列表端点已知且固定，扫码拿不到它也无妨；沿用已有配置优先。
+        "list_url_template": list_url_template or existing.get("list_url_template"),
+        "cookie_header": cookie_header,
+        "user_agent": user_agent or existing.get("user_agent"),
+        "referer": referer or existing.get("referer"),
+        "extra_headers": existing.get("extra_headers") or {},
+    }
+    from .storage import write_json_atomic
+
+    write_json_atomic(path, session)
+
+    from .utils import redact_url
+
+    return {
+        "path": str(path),
+        "cookie_names": creds.cookie_names(),
+        "looks_logged_in": True,
+        "list_url_template_redacted": redact_url(session["list_url_template"] or ""),
+    }
+
+
 def load_credentials(secrets_dir: Path = SECRETS_DIR) -> Credentials:
     """按优先级加载凭证。全部缺失时返回 ``present=False`` 的空凭证，不抛错。"""
     env_cookie = os.environ.get("BAIDU_ARCHIVE_COOKIE", "").strip()

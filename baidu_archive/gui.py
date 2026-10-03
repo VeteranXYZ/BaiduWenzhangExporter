@@ -329,6 +329,56 @@ class Api:
         except Exception:  # noqa: BLE001
             return None
 
+    # ---------- 凭证 ----------
+    def start_login(self) -> dict[str, Any]:
+        """打开百度登录窗口。登录由用户本人在窗口里完成，程序只取结果 Cookie。
+
+        立即返回；结果通过主窗口的 onLoginResult() 回调推给界面。
+        """
+        from .login import open_login_window
+
+        def done(payload: dict[str, Any]) -> None:
+            if payload.get("ok"):
+                self._application = None          # 凭证变了，Application 需重建
+                _notify("登录成功", "凭证已保存到本地")
+            if self.window:
+                import json as _json
+
+                try:
+                    self.window.evaluate_js(f"onLoginResult({_json.dumps(payload, ensure_ascii=False)})")
+                except Exception:  # noqa: BLE001
+                    pass
+
+        try:
+            open_login_window(self.config, on_result=done, user_agent=self.config.user_agent)
+            return {"ok": True, "opened": True}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)[:200]}
+
+    def import_curl_text(self, text: str) -> dict[str, Any]:
+        """粘贴 cURL 导入（扫码失败时的兜底）。校验由 Application.save_session 负责。"""
+        try:
+            self._app().save_session({"curl": text or ""})
+            self._application = None
+            return {"ok": True}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)[:200]}
+
+    def check_connection(self) -> dict[str, Any]:
+        """实测连通性：真发一次列表请求，而不是只看 Cookie 在不在。"""
+        return self.start_task("connection")
+
+    def credential_state(self) -> dict[str, Any]:
+        from .auth import load_credentials
+
+        creds = load_credentials()
+        return {
+            "present": creds.present,
+            "logged_in": creds.looks_logged_in(),
+            "source": creds.source,
+            "cookie_names": creds.cookie_names(),      # 只回名字，不回值
+        }
+
     # ---------- 导出 ----------
     def export_to(self, what: str, keys: list[str] | None = None) -> dict[str, Any]:
         """原生目录选择器 + 实际导出。``what`` 为 selection / images。"""

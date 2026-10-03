@@ -21,6 +21,7 @@ let current = "dashboard";
 const selected = new Set();
 const filters = { query: "", type: "page" };
 let reading = null;              // 正在阅读的文章
+let credential = null;           // 凭证状态（只含 cookie 名，不含值）
 
 /* ---------- 与 Python 通信 ---------- */
 async function api(method, ...args) {
@@ -310,12 +311,45 @@ const PAGES = {
 
   settings() {
     const s = library?.settings || {};
+    const c = credential;
+    const state = c?.logged_in ? "ok" : (c?.present ? "weak" : "none");
+    const conn = library?.connection?.state;
     return `
     <article class="surface-card">
+      <div class="section-heading"><div><span class="eyebrow">ACCOUNT</span><h3>百度账号</h3></div>
+        ${state === "ok" ? `<span class="badge tone-green">已登录</span>`
+          : state === "weak" ? `<span class="badge tone-orange">凭证可疑</span>`
+          : `<span class="badge tone-orange">未登录</span>`}</div>
+
+      ${state === "ok" ? `
+        <p class="hint">凭证保存在 <code>secrets/session.json</code>（权限 0600，已被 .gitignore 挡住）。
+        Cookie 名：${esc((c.cookie_names || []).join("、"))}${conn === "connected" ? " · 连接已实测通过" : ""}</p>
+        <div class="row"><div class="row-main"><strong>重新登录</strong><small>Cookie 失效时使用</small></div>
+          <button class="btn-text" data-act="login">打开登录窗口</button></div>
+        <div class="row"><div class="row-main"><strong>测试连接</strong><small>真发一次列表请求验证可用性</small></div>
+          <button class="btn-text" data-act="check-conn">测试</button></div>
+      ` : `
+        <p class="hint">归档的是你本人账号的历史内容，需要先登录。
+        点击下面的按钮会打开百度官方登录页，<strong>扫码或输入账密都由你自己在那个窗口完成</strong> ——
+        本程序不会代填任何账号信息，只在登录成功后读取 Cookie。</p>
+        <div class="login-actions">
+          <button class="btn-primary" data-act="login">
+            <svg width="15" height="15"><use href="#i-user"/></svg> 登录百度账号
+          </button>
+          <button class="btn-text" data-act="toggle-curl">改用 cURL 导入</button>
+        </div>
+        <div class="curl-box" id="curlBox" hidden>
+          <p class="hint">浏览器 F12 → Network → 筛选 Fetch/XHR → 滚动列表 →
+          找到返回 JSON 的 <code>/fav/list</code> 请求 → 右键 Copy as cURL → 粘贴到这里。</p>
+          <textarea id="curlInput" placeholder="curl 'https://wenzhang.baidu.com/fav/list?...' -H 'Cookie: ...'"></textarea>
+          <button class="btn-primary" data-act="save-curl">导入</button>
+        </div>
+      `}
+      <p class="login-status" id="loginStatus"></p>
+    </article>
+
+    <article class="surface-card">
       <div class="section-heading"><div><span class="eyebrow">SETTINGS</span><h3>设置</h3></div></div>
-      <div class="row"><div class="row-main"><strong>凭证</strong><small>${
-        library?.connection?.state === "saved" ? "已保存，存于 secrets/（权限 0600）" : "尚未提供"}</small></div>
-        <button class="btn-text" data-act="import">导入 cURL</button></div>
       <div class="row"><div class="row-main"><strong>请求间隔</strong><small>面对遗留系统，可靠性优先于速度</small></div><strong>${esc(s.delay ?? "0.8")}s</strong></div>
       <div class="row"><div class="row-main"><strong>并发数</strong><small>建议不超过 3</small></div><strong>${esc(s.concurrency ?? "2")}</strong></div>
       <div class="row"><div class="row-main"><strong>归档目录</strong><small>${esc(stats.root || "archive/")}</small></div>
@@ -360,6 +394,7 @@ function goto(page) {
     el.classList.toggle("active", el.dataset.page === page));
   render();
   if (["archives", "media", "skips", "tasks", "settings"].includes(page)) loadLibrary();
+  if (page === "settings") api("credential_state").then((c) => { credential = c; render(); });
 }
 
 async function openArticle(key) {
@@ -438,9 +473,31 @@ document.addEventListener("click", async (e) => {
     if (what === "select-page") { records().slice(0, 200).filter((r) => r.type === "page").forEach((r) => selected.add(r.key)); return render(); }
     if (what === "stop") { taskJob = await api("stop_task"); return render(); }
     if (what === "reveal") return api("reveal_archive");
-    if (what === "import") {
-      const file = await api("choose_file");
-      if (file) await api("notify", "已选择", "请在命令行运行 import-curl 完成导入");
+
+    if (what === "login") {
+      setLoginStatus("正在打开百度登录窗口，请在那个窗口里完成登录…");
+      const r = await api("start_login");
+      if (r && !r.ok) setLoginStatus("打不开登录窗口：" + (r.error || "未知错误"), true);
+      return;
+    }
+    if (what === "toggle-curl") {
+      const box = document.getElementById("curlBox");
+      if (box) box.hidden = !box.hidden;
+      return;
+    }
+    if (what === "save-curl") {
+      const text = document.getElementById("curlInput")?.value || "";
+      if (!text.trim()) return setLoginStatus("请先粘贴 cURL 内容", true);
+      setLoginStatus("正在导入…");
+      const r = await api("import_curl_text", text);
+      if (r?.ok) { setLoginStatus("导入成功，正在测试连接…"); await afterLogin(); }
+      else setLoginStatus(r?.error || "导入失败", true);
+      return;
+    }
+    if (what === "check-conn") {
+      setLoginStatus("正在测试连接…");
+      await api("check_connection");
+      pollTask();
       return;
     }
   }
@@ -480,6 +537,34 @@ function applySystemTheme(isDark) {
 }
 applySystemTheme(mq.matches);
 mq.addEventListener("change", (ev) => applySystemTheme(ev.matches));
+
+/* ---------- 登录 ---------- */
+function setLoginStatus(text, isError = false) {
+  const el = document.getElementById("loginStatus");
+  if (!el) return;
+  el.textContent = text || "";
+  el.className = "login-status" + (isError ? " is-error" : "");
+}
+
+async function afterLogin() {
+  credential = await api("credential_state");
+  await loadLibrary(true);
+  await refresh();
+  render();
+}
+
+/* 由 Python 在登录窗口拿到 Cookie 后调用 */
+window.onLoginResult = async (payload) => {
+  if (payload?.ok) {
+    setLoginStatus("登录成功，凭证已保存。正在读取归档…");
+    await afterLogin();
+    setLoginStatus("登录成功。可以开始抓取了。");
+  } else if (payload?.cancelled) {
+    setLoginStatus("已取消登录");
+  } else {
+    setLoginStatus(payload?.error || "登录未完成", true);
+  }
+};
 
 /* 让它不像网页：禁右键菜单、禁拖拽 */
 document.addEventListener("contextmenu", (e) => e.preventDefault());
