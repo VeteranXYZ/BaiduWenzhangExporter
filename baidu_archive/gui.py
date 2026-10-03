@@ -93,10 +93,32 @@ def _disk_usage(root: Path) -> int:
     return total
 
 
+def _reconcile_statuses(config: Config, state: ArchiveState) -> int:
+    """让数据库里的文章状态等于真相层的判断。返回状态有变化的篇数。
+
+    真相层只会降级、不会升级：数据库若停在 parsed，即使一切就绪也不会显示为完整。
+    做法是先假定完整，再交给 article_truth 逐项核对 —— 它会按实际字节把有问题的
+    降回 assets_partial 等状态。只改状态字段，不碰任何资源记录。
+    """
+    from .truth import article_truth
+
+    changed = 0
+    for record in state.iter_records("page"):
+        key = record["key"]
+        current = (state.get_item(key) or {}).get("status")
+        if current not in {"parsed", "complete", "assets_partial", "legacy_unverified"}:
+            continue                    # 未下载 / 失败 / 有警告的不在这里处理
+        state.update_item(key, status="complete")
+        effective = article_truth(config, state, key)["status"]
+        state.update_item(key, status=effective)
+        changed += effective != current
+    return changed
+
+
 def _offline_client(config: Config):
     """一个拒绝任何网络请求的客户端，用于离线修复。
 
-    修复流程复用 run_index / run_assets，它们需要一个 client 参数；
+    离线整理复用 run_index，它需要一个 client 参数；
     这里给的 client 一旦被要求联网就直接报错，保证「离线修复」名副其实。
     """
     import httpx
@@ -667,21 +689,19 @@ class Api:
             return None
 
     def repair_offline(self) -> dict[str, Any]:
-        """一键修复旧数据：全程离线，不发任何网络请求。
+        """离线整理旧版本归档。只读写本地记录，从不下载、也从不改写任何下载结果。
 
-        旧版本抓下来的内容都还在磁盘上，只是缺少新版要求的校验记录，
-        于是被一律判为「不可信」。这里按 RAW FIRST 的设计，从已保存的原始数据补齐：
+        旧版本抓下来的内容都还在磁盘上，只是缺少新版要求的校验记录：
+          1. 证明索引完整：复用已保存的原始列表页（不联网）
+          2. 补证：逐个核对已下载图片的字节，补写校验记录、重建本地阅读版
+          3. 对齐状态：让每篇文章在数据库里的状态等于真相层的判断
 
-          1. 补证：逐个核对已下载图片的字节，补写校验记录
-          2. 重建索引证明：复用已保存的原始列表页，证明收藏一条不漏
-          3. 重新评估：只处理图片已全部就绪的文章，把状态更新为「完整」
-
-        第 3 步刻意排除含失败图片的文章 —— 离线状态下重试必然失败，
-        会把它们原本的失败原因（如 HTTP 504）覆盖掉，而失败本身也是档案信息。
+        这里刻意不调用 run_assets：它是「下载并自我修复」的函数，会把校验未通过的
+        图片（例如图床占位图）先作废再重新下载。早先的实现在离线整理里调了它，
+        结果 111 条原本下载成功的记录被离线客户端拒绝后改写成了失败。
         """
         if self._busy():
-            return {"ok": False, "error": "有任务正在进行，请等它结束后再修复"}
-        from .assets import run_assets
+            return {"ok": False, "error": "有任务正在进行，请等它结束后再整理"}
         from .legacy import rebuild_legacy_evidence
         from .locking import ArchiveLock
         from .pipeline import run_index
@@ -689,23 +709,16 @@ class Api:
         steps: dict[str, Any] = {}
         before = self.get_verified_stats()
         client = _offline_client(self.config)
+        quiet = lambda *_a, **_k: None  # noqa: E731 —— 整理过程不需要逐条输出
         try:
             with ArchiveLock(self.config.root), ArchiveState(self.config.db_path) as state:
-                steps["legacy"] = rebuild_legacy_evidence(self.config, state)
                 try:
-                    run_index(self.config, state, client, force=False)
+                    run_index(self.config, state, client, force=False, log=quiet)
                     steps["index"] = "ok"
                 except Exception as exc:  # noqa: BLE001 —— 原始页不全时会想联网，离线客户端会拦下
-                    steps["index"] = f"原始列表页不完整，需要联网更新一次收藏列表（{type(exc).__name__}）"
-
-                ready = []
-                for record in state.iter_records("page"):
-                    images = [a for a in state.assets_for(record["key"]) if a.get("kind") == "image"]
-                    if all(a.get("download_status") == "ok" for a in images):
-                        ready.append(record["key"])
-                if ready:
-                    run_assets(self.config, state, client, only_keys=ready)
-                steps["reevaluated"] = len(ready)
+                    steps["index"] = f"原始列表页不完整，下次「检查更新」时会重新读取（{type(exc).__name__}）"
+                steps["legacy"] = rebuild_legacy_evidence(self.config, state)
+                steps["reconciled"] = _reconcile_statuses(self.config, state)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)[:200], "steps": steps}
         finally:

@@ -57,6 +57,13 @@ def rebuild_legacy_evidence(config, state, *, control=None) -> dict:
                     raise IntegrityError('resolved_resource_identity_mismatch')
                 candidate = {k: v for k, v in asset.items() if k != 'download_identity'}
                 validation = validate_downloaded_asset(config, candidate)
+                if validation['reason'] == 'invalid_media_placeholder':
+                    # 字节与记录一致，只是内容是图床的「图片不存在」占位图。它本身不算保存成功，
+                    # 但并不说明这篇文章的记录不可信 —— 不能因此连累同篇其他照片。
+                    # 记录原样保留，由真相层按占位图归类为「原图已被删除」。
+                    result.setdefault('placeholders', 0)
+                    result['placeholders'] += 1
+                    continue
                 if not validation['ok']:
                     raise IntegrityError(validation['reason'])
                 if asset.get('size') is None:

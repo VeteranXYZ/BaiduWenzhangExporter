@@ -866,3 +866,62 @@ def test_prepare_archive_migrates_legacy_silently_with_backup(archive, monkeypat
 def test_prepare_archive_on_fresh_install(tmp_path, monkeypatch):
     gui = _gui(monkeypatch)
     assert gui.Api(Config(root=tmp_path / 'nothing')).prepare_archive() == {'state': 'empty', 'migrated': False}
+
+
+def _two_image_legacy_archive(tmp_path, monkeypatch):
+    """一篇文章两张图：一张真照片、一张图床占位图；模拟旧版本留下的归档。"""
+    import io
+    from PIL import Image
+    buffer = io.BytesIO(); Image.new('RGB', (3, 3), (200, 30, 30)).save(buffer, 'PNG')
+    placeholder = buffer.getvalue()
+    cfg = Config(root=tmp_path / 'archive', delay=0, jitter=0, max_retries=1,
+                 list_url_template='https://wenzhang.baidu.com/fav/list?start={start}&limit={limit}')
+    cfg.ensure_dirs()
+    state = ArchiveState(cfg.db_path)
+    with transport(cfg, lambda r: httpx.Response(200, content=list_body(['one']))) as client:
+        run_index(cfg, state, client, force=True)
+    raw_article(cfg, 'one', '<p>Body</p><img src="real.png"><img src="gone.png">')
+    run_parse(cfg, state)
+    bodies = {'real.png': PNG, 'gone.png': placeholder}
+    with transport(cfg, lambda r: httpx.Response(200, content=bodies[str(r.url).rsplit('/', 1)[-1]],
+                                                 headers={'content-type': 'image/png'})) as client:
+        run_assets(cfg, state, client)
+    assert {a['download_status'] for a in state.assets_for('one')} == {'ok'}
+    _as_placeholder(monkeypatch, placeholder)              # 之后才认出它是占位图
+    for asset in state.assets_for('one'):                   # 旧版本没有身份记录与索引证明
+        state.record_asset_result('one', asset['original_url'], asset['attribute'], download_identity=None)
+    state.set_meta('index_generation', None)
+    return cfg, state
+
+
+def test_offline_migration_never_rewrites_download_results(tmp_path, monkeypatch):
+    """回归：离线整理曾调用 run_assets，后者把校验未通过的图片作废并尝试重下载，
+    被离线客户端拒绝后把原本「下载成功」的记录改写成失败（真实归档里 111 条）。"""
+    gui = _gui(monkeypatch)
+    cfg, state = _two_image_legacy_archive(tmp_path, monkeypatch)
+    before = {(a['original_url'], a['download_status'], a['http_status'], a['error'], a['local_path'])
+              for a in state.assets_for('one')}
+    import baidu_archive.assets as assets_module
+    monkeypatch.setattr(assets_module, 'run_assets', lambda *a, **k: pytest.fail('离线整理不得调用 run_assets'))
+    api = gui.Api(cfg); monkeypatch.setattr(api, 'get_task', lambda: None)
+    assert api.prepare_archive()['migrated'] is True
+    after = {(a['original_url'], a['download_status'], a['http_status'], a['error'], a['local_path'])
+             for a in state.assets_for('one')}
+    assert after == before
+
+
+def test_placeholder_does_not_block_evidence_for_other_photos(tmp_path, monkeypatch):
+    """回归：补证曾按篇「全有或全无」，一张占位图就让同篇真照片全部停在待校验，
+    而且因此每次打开软件都会重新整理一遍。"""
+    gui = _gui(monkeypatch)
+    cfg, state = _two_image_legacy_archive(tmp_path, monkeypatch)
+    api = gui.Api(cfg); monkeypatch.setattr(api, 'get_task', lambda: None)
+    result = api.prepare_archive()
+    by_url = {a['original_url']: a for a in state.assets_for('one')}
+    assert validate_downloaded_asset(cfg, by_url['real.png'])['ok']          # 真照片通过校验
+    assert not validate_downloaded_asset(cfg, by_url['gone.png'])['ok']      # 占位图不算保存成功
+    assert result['after']['assets_downloaded'] == 1 and result['after']['assets_legacy_unverified'] == 0
+    assert article_truth(cfg, state, 'one')['status'] == 'assets_partial'
+    groups = api.get_problems()
+    assert [g['key'] for g in groups['baidu_deleted']] == ['one'] and not groups['unverified']
+    assert api.prepare_archive() == {'state': 'ready', 'migrated': False}    # 第二次打开什么都不做
