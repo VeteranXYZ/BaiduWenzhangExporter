@@ -251,3 +251,28 @@ body {
 /* ---- 页面切换：0.14s，比网页惯用的 0.3s 快一倍 ---- */
 .page { animation: page-in .14s ease; }
 @keyframes page-in { from { opacity: 0; transform: translateY(5px); } }
+
+/* ---- 提示横幅：索引不完整等需要解释的状态 ---- */
+.notice {
+  display: flex; align-items: flex-start; gap: 14px;
+  padding: 16px 18px; margin-bottom: 22px;
+  border: 1px solid color-mix(in srgb, var(--tone-orange-fg) 28%, transparent);
+  border-radius: 16px;
+  background: var(--tone-orange-bg);
+}
+.notice-icon {
+  display: grid; place-items: center;
+  width: 36px; height: 36px; flex: 0 0 36px;
+  border-radius: 11px;
+  color: var(--tone-orange-fg);
+  background: color-mix(in srgb, var(--tone-orange-fg) 14%, transparent);
+}
+.notice > div { flex: 1; min-width: 0; }
+.notice strong { display: block; font-size: 14px; color: var(--heading); }
+.notice p { margin: 5px 0 0; color: var(--muted); font-size: 12.5px; line-height: 1.6; }
+.notice .btn-text { flex: 0 0 auto; align-self: center; }
+
+/* ---- 校验状态 ---- */
+.verifying { color: #d9e9ff; opacity: .85; animation: pulse 1.4s ease-in-out infinite; }
+.verified-mark { color: #d9e9ff; opacity: .7; }
+@keyframes pulse { 50% { opacity: .4; } }

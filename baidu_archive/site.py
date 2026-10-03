@@ -11,7 +11,7 @@ from .config import Config
 from .parsers import make_soup
 from .state import ArchiveState
 from .truth import validated_reading_content, validate_downloaded_asset
-from .storage import current_content_path, read_json, read_text, write_atomic, write_text_atomic
+from .storage import current_content_path, read_json, write_atomic, write_text_atomic
 from .utils import safe_key_dirname, utcnow_iso
 
 

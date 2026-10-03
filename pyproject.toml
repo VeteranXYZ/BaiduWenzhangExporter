@@ -19,6 +19,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# 原生窗口界面。CLI 不依赖它，缺失时 `gui` 子命令会给出安装提示。
+gui = ["pywebview>=6.0"]
 
 [project.scripts]
 baidu-archive = "baidu_archive.cli:main"
@@ -32,3 +34,8 @@ baidu_archive = ["web/*.css", "web/*.js", "dashboard/*.html", "dashboard/*.css",
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.ruff.lint.per-file-ignores]
+# pytest 跨文件共享 fixture 的标准写法是 import 后作为参数使用，
+# ruff 会误报 F401/F811。测试目录豁免这两条，其余规则照常。
+"tests/*" = ["F401", "F811"]

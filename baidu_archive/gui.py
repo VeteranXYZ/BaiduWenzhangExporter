@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -94,46 +93,43 @@ class Api:
         self.window: webview.Window | None = None
 
     # ---------- 数据 ----------
+    EMPTY_STATS = {
+        "total_api": 0, "indexed": 0, "page": 0, "article": 0, "other": 0,
+        "complete": 0, "warning": 0, "failed": 0, "pending": 0,
+        "legacy_unverified": 0, "assets_legacy_unverified": 0,
+        "assets_downloaded": 0, "assets_failed": 0, "historical_indexed": 0,
+        "index_complete": None, "db_size": "—", "has_db": False, "verified": False,
+    }
+
+    def _empty(self) -> dict[str, Any]:
+        return {**self.EMPTY_STATS, "root": str(self.config.root.resolve())}
+
     def get_stats(self) -> dict[str, Any]:
-        empty = {
-            "total_api": 0, "indexed": 0, "page": 0, "article": 0, "other": 0,
-            "complete": 0, "warning": 0, "failed": 0, "pending": 0,
-            "assets_downloaded": 0, "assets_failed": 0,
-            "db_size": "—", "has_db": False, "root": str(self.config.root.resolve()),
-        }
+        """首屏用的瞬时快照：只读数据库记账，不做任何磁盘校验。
+
+        数字可能偏乐观（数据库说下载成功，字节却可能已损坏），所以 ``verified``
+        为 False，界面据此显示「校验中」。真实结论由 get_verified_stats() 给出。
+        """
         if not self.config.db_path.exists():
-            return empty
+            return self._empty()
         try:
             with ArchiveState(self.config.db_path) as state:
                 types = state.type_counts()
-                statuses = {}
-                for record in state.iter_records('page'):
-                    status = article_truth(self.config, state, record['key'])['status']
-                    statuses[status] = statuses.get(status, 0) + 1
-                assets = {'ok': 0, 'failed': 0, 'legacy': 0}
-                for asset in state.all_assets():
-                    valid = validate_downloaded_asset(self.config, asset)['ok']
-                    assets['ok'] += valid
-                    legacy = resource_state(self.config, asset)['state'] == 'legacy_unverified'
-                    assets['legacy'] += legacy
-                    assets['failed'] += bool(asset.get('download_attempted') and not valid and not legacy)
-                total = 0
-                for path in (self.config.root,):
-                    for file in path.rglob("*"):
-                        if file.is_file():
-                            try:
-                                total += file.stat().st_size
-                            except OSError:
-                                pass
+                statuses = state.status_counts()
+                assets = state.asset_counts()
+                index = index_truth(state)
+                try:
+                    db_bytes = self.config.db_path.stat().st_size
+                except OSError:
+                    db_bytes = 0
                 return {
-                    **empty,
+                    **self._empty(),
                     "has_db": True,
-                    "legacy_unverified": statuses.get("legacy_unverified", 0),
-                    "assets_legacy_unverified": assets["legacy"],
+                    "verified": False,
                     "total_api": state.get_meta("total_count") or 0,
-                    "indexed": index_truth(state)["indexed"],
+                    "indexed": index["indexed"],
                     "historical_indexed": state.count_records(),
-                    "index_complete": index_truth(state)["ok"],
+                    "index_complete": index["ok"],
                     "page": types.get("page", 0),
                     "article": types.get("article", 0),
                     "other": types.get("other", 0),
@@ -143,10 +139,79 @@ class Api:
                     "pending": statuses.get("pending", 0),
                     "assets_downloaded": assets.get("ok", 0),
                     "assets_failed": assets.get("failed", 0),
-                    "db_size": _human_bytes(total),
+                    "db_size": _human_bytes(db_bytes),
                 }
         except Exception:  # noqa: BLE001 —— 界面不能因为读库失败而白屏
-            return empty
+            return self._empty()
+
+    def get_verified_stats(self) -> dict[str, Any]:
+        """完整校验：逐篇核对磁盘字节，这才是能用来下结论的数字。
+
+        耗时随归档规模线性增长（约 300 篇 / 900 资源 ≈ 1s），前端在首屏之后
+        异步调用，期间界面照常可用 —— pywebview 的 js_api 本就跑在独立线程上。
+
+        性能要点：article_truth() 内部已经校验过该篇的全部资源并在 usable_assets
+        里给出结果，此处直接复用，不再重复校验（早先的实现会把每个资源验 3 遍）。
+        """
+        if not self.config.db_path.exists():
+            return self._empty()
+        try:
+            with ArchiveState(self.config.db_path) as state:
+                types = state.type_counts()
+                statuses: dict[str, int] = {}
+                usable_ids: set[Any] = set()
+                for record in state.iter_records("page"):
+                    facts = article_truth(self.config, state, record["key"])
+                    statuses[facts["status"]] = statuses.get(facts["status"], 0) + 1
+                    usable_ids.update(facts["usable_assets"])
+
+                ok = failed = legacy = 0
+                for asset in state.all_assets():
+                    valid = asset["id"] in usable_ids
+                    if not valid and asset.get("download_status") == "ok":
+                        # 不属于任何 page 条目的资源（例如 article 类型）仍需单独校验
+                        valid = validate_downloaded_asset(self.config, asset)["ok"]
+                    is_legacy = (
+                        not valid
+                        and asset.get("download_attempted")
+                        and resource_state(self.config, asset)["state"] == "legacy_unverified"
+                    )
+                    ok += valid
+                    legacy += bool(is_legacy)
+                    failed += bool(asset.get("download_attempted") and not valid and not is_legacy)
+
+                total = 0
+                for file in self.config.root.rglob("*"):
+                    if file.is_file():
+                        try:
+                            total += file.stat().st_size
+                        except OSError:
+                            pass
+
+                index = index_truth(state)
+                return {
+                    **self._empty(),
+                    "has_db": True,
+                    "verified": True,
+                    "legacy_unverified": statuses.get("legacy_unverified", 0),
+                    "assets_legacy_unverified": legacy,
+                    "total_api": state.get_meta("total_count") or 0,
+                    "indexed": index["indexed"],
+                    "historical_indexed": state.count_records(),
+                    "index_complete": index["ok"],
+                    "page": types.get("page", 0),
+                    "article": types.get("article", 0),
+                    "other": types.get("other", 0),
+                    "complete": statuses.get("complete", 0),
+                    "warning": statuses.get("warning", 0),
+                    "failed": statuses.get("failed", 0) + statuses.get("auth_error", 0),
+                    "pending": statuses.get("pending", 0),
+                    "assets_downloaded": ok,
+                    "assets_failed": failed,
+                    "db_size": _human_bytes(total),
+                }
+        except Exception:  # noqa: BLE001
+            return self._empty()
 
     # ---------- 系统集成 ----------
     def choose_directory(self) -> str | None:

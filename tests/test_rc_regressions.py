@@ -381,13 +381,24 @@ def test_gui_data_api_uses_shared_truth_without_a_native_window(archive, monkeyp
     cfg, state = archive
     download(cfg, state)
     api = gui.Api(cfg)
-    assert api.get_stats()['complete'] == 1
+
+    # 界面取数分两级：get_stats 是首屏用的数据库快照（毫秒级，可能偏乐观），
+    # get_verified_stats 才逐字节核对、才允许下结论。真相断言落在后者。
+    assert api.get_verified_stats()['complete'] == 1
     (cfg.item_dir('one') / state.assets_for('one')[0]['local_path']).unlink()
-    stats = api.get_stats()
+    stats = api.get_verified_stats()
     assert stats['complete'] == 0 and stats['assets_downloaded'] == 0 and stats['assets_failed'] == 1
+    assert stats['verified'] is True
+
+    # 快路径绝不能冒充已核实 —— 它可以乐观，但必须自曝身份，
+    # 否则界面会把数据库的记账当成事实展示给用户。
+    quick = api.get_stats()
+    assert quick['verified'] is False
+
     generation = state.get_meta('index_generation'); generation['complete'] = False
     state.set_meta('index_generation', generation)
-    assert not api.get_stats()['index_complete']
+    assert not api.get_verified_stats()['index_complete']
+    assert not api.get_stats()['index_complete']   # 索引完整性两级都如实反映
     sys.modules.pop('baidu_archive.gui', None)
 
 

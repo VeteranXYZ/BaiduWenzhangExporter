@@ -17,7 +17,9 @@ import httpx
 
 from .client import ArchiveClient, AuthExpired
 from .config import Config
-from .media import image_extension, validate_media_response
+from .media import validate_media_response
+# 转发导出：本模块不直接使用，但外部（含测试）从 assets 导入它。
+from .media import image_extension as image_extension
 from .truth import article_truth, index_truth, resource_fingerprint, resource_identity, validate_downloaded_asset
 from uuid import uuid4
 from .parsers import extract_assets, make_soup, parse_srcset

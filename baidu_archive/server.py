@@ -96,7 +96,6 @@ class Application:
                 counts['failed'] += bool(asset['download_attempted'] and not valid and resource['state'] != 'legacy_unverified')
             for record in state.iter_records():
                 key = record['key']
-                item = state.get_item(key) or {}
                 meta = read_json(self.config.item_dir(key) / 'metadata.json', {}) or {}
                 facts = article_truth(self.config, state, key)
                 available = facts['available']

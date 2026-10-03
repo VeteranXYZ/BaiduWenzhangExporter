@@ -22,9 +22,21 @@ async function api(method, ...args) {
   catch (err) { console.error(method, err); return null; }
 }
 
+/* 两级加载：先用数据库记账瞬时出数（约 1ms），再在后台逐字节校验（约 1s / 300 篇）。
+   校验期间界面照常可用 —— pywebview 的 js_api 跑在独立线程上，不会冻结窗口。 */
+let verifying = false;
+
 async function refresh() {
-  const data = await api("get_stats");
-  if (data) { stats = data; render(); }
+  const quick = await api("get_stats");
+  if (quick) { stats = quick; render(); }
+  if (!quick?.has_db) return;
+
+  verifying = true;
+  render();
+  const verified = await api("get_verified_stats");
+  verifying = false;
+  if (verified) stats = verified;
+  render();
 }
 
 /* ---------- 渲染 ---------- */
@@ -46,7 +58,9 @@ const PAGES = {
     return `
     <section class="hero">
       <div>
-        <p class="eyebrow">${stats.has_db ? `已索引 ${stats.indexed} 条` : "开始使用"}</p>
+        <p class="eyebrow">${stats.has_db ? `已索引 ${stats.indexed} 条` : "开始使用"}${
+          verifying ? ' <span class="verifying">· 正在逐字节校验…</span>'
+                    : (stats.verified ? ' <span class="verified-mark">· 已核实</span>' : "")}</p>
         <h2>${stats.has_db ? "继续归档你的百度空间" : "把十几年前的记忆，留在本地"}</h2>
         <p>${stats.has_db
           ? `本地已保存 ${stats.complete} 篇正文、${stats.assets_downloaded} 个资源。`
@@ -57,6 +71,18 @@ const PAGES = {
         ${stats.has_db ? "继续归档" : "导入 Cookie"}
       </button>
     </section>
+
+    ${stats.has_db && stats.index_complete === false ? `
+    <section class="notice">
+      <span class="notice-icon"><svg width="18" height="18"><use href="#i-alert"/></svg></span>
+      <div>
+        <strong>索引尚未完整，因此没有文章会被标记为「已完成」</strong>
+        <p>接口声明 ${stats.total_api || "—"} 条，当前已核实 ${stats.indexed} 条。
+        在确认一条不漏之前，归档不会对单篇下「完整」的结论 —— 这是刻意的保守设计，
+        不代表已抓到的内容有问题。补齐索引后，这些文章会自动转为已完成。</p>
+      </div>
+      <button class="btn-text" data-goto="tasks">去补齐</button>
+    </section>` : ""}
 
     <section class="stats">
       ${statCard("blue", "doc", "总记录", stats.indexed || "—", stats.total_api ? `接口声明 ${stats.total_api} 条` : "等待首次索引")}
