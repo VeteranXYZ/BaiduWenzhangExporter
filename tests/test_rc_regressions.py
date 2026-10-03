@@ -494,3 +494,73 @@ def test_assets_refuses_unparsed_raw_generation_without_republishing(archive):
             run_assets(cfg, state, client)
     assert (cfg.item_dir('one') / 'content.local.html').read_bytes() == before
     assert state.get_item('one')['status'] == 'parsed'
+
+
+def _gui(monkeypatch):
+    """导入 gui 时打桩掉可选的 webview 依赖，数据方法本身原样执行。"""
+    import importlib, sys, types
+    view = types.ModuleType('webview'); menu = types.ModuleType('webview.menu')
+    menu.Menu = menu.MenuAction = menu.MenuSeparator = object
+    monkeypatch.setitem(sys.modules, 'webview', view)
+    monkeypatch.setitem(sys.modules, 'webview.menu', menu)
+    module = importlib.import_module('baidu_archive.gui')
+    sys.modules.pop('baidu_archive.gui', None)
+    return module
+
+
+def test_gui_library_reuses_server_application(archive, monkeypatch):
+    """归档/媒体/异常三页共用 Application.library()，不另起一套统计口径。"""
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    download(cfg, state)
+    data = gui.Api(cfg).get_library()
+    assert [r['key'] for r in data['records']] == ['one']
+    assert data['records'][0]['status'] == 'complete'
+    assert data['summary']['downloaded'] == 1
+
+
+def test_gui_article_inlines_only_validated_bytes(archive, monkeypatch):
+    """预览把图片内联成 data URI；字节一旦损坏就必须降级为占位，不能照样显示。"""
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    download(cfg, state)
+    api = gui.Api(cfg)
+
+    good = api.get_article('one')
+    assert good['images_inlined'] == 1 and good['images_missing'] == 0
+    assert 'data:image/png;base64,' in good['html']
+
+    (cfg.item_dir('one') / state.assets_for('one')[0]['local_path']).unlink()
+    broken = api.get_article('one')
+    assert broken['images_inlined'] == 0 and broken['images_missing'] == 1
+    assert 'data:image/png;base64,' not in broken['html']
+    assert 'data-archive-missing' in broken['html']
+
+
+def test_gui_article_rejects_unknown_key(archive, monkeypatch):
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    assert 'error' in gui.Api(cfg).get_article('没有这个 key')
+
+
+def test_gui_export_cancelled_when_no_directory_chosen(archive, monkeypatch):
+    """用户在原生目录选择器里按取消时，不得写出任何文件。"""
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    api = gui.Api(cfg)
+    monkeypatch.setattr(api, 'choose_directory', lambda: None)
+    assert api.export_to('selection', ['one']) == {'ok': False, 'cancelled': True}
+    assert not list((cfg.root / 'exports').glob('*.zip')) if (cfg.root / 'exports').exists() else True
+
+
+def test_gui_export_writes_zip_into_chosen_directory(archive, monkeypatch, tmp_path):
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    download(cfg, state)
+    api = gui.Api(cfg)
+    target = tmp_path / 'out'; target.mkdir()
+    monkeypatch.setattr(api, 'choose_directory', lambda: str(target))
+    monkeypatch.setattr(gui, '_notify', lambda *a: None)
+    result = api.export_to('images', ['one'])
+    assert result['ok'] and Path(result['path']).parent == target
+    assert Path(result['path']).suffix == '.zip' and Path(result['path']).is_file()

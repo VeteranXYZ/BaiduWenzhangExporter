@@ -91,6 +91,9 @@ class Api:
     def __init__(self, config: Config):
         self.config = config
         self.window: webview.Window | None = None
+        # 懒建：Application 会在构造时创建目录、读任务状态并生成令牌，
+        # 没必要在窗口还没打开时就做这些。
+        self._application: Any = None
 
     # ---------- 数据 ----------
     EMPTY_STATS = {
@@ -212,6 +215,143 @@ class Api:
                 }
         except Exception:  # noqa: BLE001
             return self._empty()
+
+    # ---------- 归档内容 / 媒体 / 任务 ----------
+    def _app(self):
+        """复用 server.Application —— 它是普通 Python 类，不需要起 HTTP 服务。"""
+        if self._application is None:
+            from .server import Application
+
+            self._application = Application(self.config)
+        return self._application
+
+    def get_library(self) -> dict[str, Any]:
+        """归档内容 / 媒体 / 异常跳过三页共用的数据源。
+
+        内部逐篇走 article_truth，耗时与 get_verified_stats 同量级，
+        前端异步调用并在期间显示加载态。
+        """
+        try:
+            return self._app().library()
+        except Exception as exc:  # noqa: BLE001
+            return {"records": [], "summary": {}, "error": str(exc)[:200]}
+
+    def get_article(self, key: str) -> dict[str, Any]:
+        """单篇阅读副本。
+
+        图片内联为 data URI —— 原生窗口没有 HTTP 服务，而 WKWebView 读取
+        页面目录之外的 file:// 资源会被拦截，内联是唯一可靠的办法。
+        只内联校验通过的本地文件；失败的图片保留占位与原始 URL，绝不删除元素。
+        """
+        import base64
+        import mimetypes
+
+        from .site import reading_html
+        from .truth import validated_reading_content
+        from .parsers import make_soup
+        from .storage import read_json
+
+        try:
+            with ArchiveState(self.config.db_path) as state:
+                record = state.get_record(key)
+                if not record:
+                    return {"error": "未找到该条目"}
+                folder = self.config.item_dir(key)
+                meta = read_json(folder / "metadata.json", {}) or {}
+                soup = make_soup(reading_html(validated_reading_content(self.config, state, key)))
+
+                budget = 24 * 1024 * 1024          # 单篇内联上限，避免超长图文撑爆 WebView
+                used = 0
+                inlined = skipped = 0
+                for node in soup.find_all(["img", "video", "audio", "source"]):
+                    src = str(node.get("src") or "")
+                    node.attrs.pop("srcset", None)   # 多分辨率候选无法内联，直接去掉
+                    if src.startswith("data:"):
+                        continue
+                    target = folder / src
+                    if not (src.startswith("assets/") and len(Path(src).parts) == 2
+                            and target.is_file()):
+                        node.attrs.pop("src", None)
+                        node["alt"] = node.get("alt") or "图片未能保存"
+                        node["data-archive-missing"] = "1"
+                        skipped += 1
+                        continue
+                    try:
+                        body = target.read_bytes()
+                    except OSError:
+                        node.attrs.pop("src", None)
+                        node["data-archive-missing"] = "1"
+                        skipped += 1
+                        continue
+                    if used + len(body) > budget:
+                        node.attrs.pop("src", None)
+                        node["alt"] = "图片过大，未在预览中载入"
+                        node["data-archive-skipped"] = "1"
+                        skipped += 1
+                        continue
+                    mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+                    node["src"] = f"data:{mime};base64," + base64.b64encode(body).decode("ascii")
+                    used += len(body)
+                    inlined += 1
+
+                return {
+                    "key": key,
+                    "title": meta.get("title") or record.get("title") or "无标题",
+                    "date": meta.get("content_date") or record.get("list_date") or "",
+                    "source": meta.get("source") or record.get("list_source") or "",
+                    "tags": (meta.get("tags") or []) + (meta.get("content_tags") or []),
+                    "note": meta.get("note") or "",
+                    "detail_url": record.get("detail_url") or "",
+                    "warnings": meta.get("warnings") or [],
+                    "html": str(soup),
+                    "images_inlined": inlined,
+                    "images_missing": skipped,
+                }
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)[:200]}
+
+    def get_task(self) -> dict[str, Any] | None:
+        try:
+            return self._app().snapshot()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def start_task(self, kind: str, keys: list[str] | None = None, **options: Any) -> dict[str, Any]:
+        payload = {"kind": kind, "keys": keys or [], **options}
+        try:
+            return {"ok": True, "job": self._app().start(payload)}
+        except Exception as exc:  # noqa: BLE001 —— 任何失败都要原样回显给用户
+            return {"ok": False, "error": str(exc)[:200]}
+
+    def stop_task(self) -> dict[str, Any] | None:
+        try:
+            return self._app().stop()
+        except Exception:  # noqa: BLE001
+            return None
+
+    # ---------- 导出 ----------
+    def export_to(self, what: str, keys: list[str] | None = None) -> dict[str, Any]:
+        """原生目录选择器 + 实际导出。``what`` 为 selection / images。"""
+        directory = self.choose_directory()
+        if not directory:
+            return {"ok": False, "cancelled": True}
+        from uuid import uuid4
+
+        from .selection import export_images, export_selection
+
+        target = Path(directory) / f"{what}-{uuid4().hex[:8]}.zip"
+        try:
+            with ArchiveState(self.config.db_path) as state:
+                chosen = list(keys or [])
+                if not chosen:
+                    chosen = [r["key"] for r in state.iter_records("page")]
+                runner = export_images if what == "images" else export_selection
+                result = runner(self.config, state, keys=chosen, output=target)
+            _notify("导出完成", f"{target.name} 已保存")
+            return {"ok": True, "path": str(target), **(result or {})}
+        except Exception as exc:  # noqa: BLE001
+            _notify("导出失败", str(exc)[:120])
+            return {"ok": False, "error": str(exc)[:200]}
 
     # ---------- 系统集成 ----------
     def choose_directory(self) -> str | None:
