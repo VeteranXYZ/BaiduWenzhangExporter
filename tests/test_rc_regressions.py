@@ -925,3 +925,26 @@ def test_placeholder_does_not_block_evidence_for_other_photos(tmp_path, monkeypa
     groups = api.get_problems()
     assert [g['key'] for g in groups['baidu_deleted']] == ['one'] and not groups['unverified']
     assert api.prepare_archive() == {'state': 'ready', 'migrated': False}    # 第二次打开什么都不做
+
+
+def test_gui_process_does_not_hold_archive_lock(tmp_path, monkeypatch):
+    """回归：命令行入口给每条命令套了一把归档锁，并在命令执行期间一直持有。
+    gui 会一直运行到窗口关闭，于是整个窗口生命周期都握着锁 —— 窗口里的下载、重试、
+    自动整理、导入凭证全部因「已有任务正在运行」失败。这也是「重试无法使用」的根因。"""
+    from baidu_archive import cli
+    from baidu_archive.locking import ArchiveLock
+    monkeypatch.chdir(tmp_path)
+    acquired = []
+
+    def fake_launch(config, debug=False):
+        with ArchiveLock(config.root):           # 窗口内的任务必须能拿到锁
+            acquired.append(True)
+    import baidu_archive.gui as gui_module
+    monkeypatch.setattr(gui_module, 'launch', fake_launch, raising=False)
+    import sys, types
+    if 'webview' not in sys.modules:
+        view = types.ModuleType('webview'); menu = types.ModuleType('webview.menu')
+        menu.Menu = menu.MenuAction = menu.MenuSeparator = object
+        monkeypatch.setitem(sys.modules, 'webview', view); monkeypatch.setitem(sys.modules, 'webview.menu', menu)
+    assert cli.main(['--root', str(tmp_path / 'archive'), 'gui']) == 0
+    assert acquired == [True]

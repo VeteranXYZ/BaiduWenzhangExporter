@@ -550,7 +550,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        guard = (nullcontext() if args.command in {"status", "import-curl", "serve"} else
+        # 长驻进程（操作台、桌面窗口）自己按任务加锁，绝不能在整个进程生命周期里持有锁：
+        # 否则窗口开着时，窗口内的下载、重试、整理、导入都会因「已有任务正在运行」失败。
+        guard = (nullcontext() if args.command in {"status", "import-curl", "serve", "gui"} else
                  ArchiveLock(load_config(root=args.root, config_file=args.config).root))
         with guard:
             return args.func(args)
