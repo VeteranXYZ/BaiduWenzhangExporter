@@ -22,6 +22,8 @@ const selected = new Set();
 const filters = { query: "", type: "page" };
 let reading = null;              // 正在阅读的文章
 let credential = null;           // 凭证状态（只含 cookie 名，不含值）
+let exporting = false;
+let exportMessage = "";
 
 /* ---------- 与 Python 通信 ---------- */
 async function api(method, ...args) {
@@ -105,10 +107,14 @@ const PAGES = {
           ? `本地已保存 ${stats.complete} 篇正文、${stats.assets_downloaded} 个资源。`
           : "导入 Cookie 后即可开始抓取文章、图片与外链记录。"}</p>
       </div>
-      <button class="btn-light" data-task="${stats.has_db ? "archive" : ""}" id="primaryAction">
-        <svg width="15" height="15"><use href="#i-${stats.has_db ? "sync" : "user"}"/></svg>
-        ${stats.has_db ? "继续归档" : "导入 Cookie"}
-      </button>
+      <div class="hero-actions">
+        ${stats.has_db && stats.complete ? `<button class="btn-ghost" data-goto="export">
+          <svg width="15" height="15"><use href="#i-export"/></svg>一键导出全部</button>` : ""}
+        <button class="btn-light" ${stats.has_db ? 'data-task="archive"' : 'data-act="login"'} id="primaryAction">
+          <svg width="15" height="15"><use href="#i-${stats.has_db ? "sync" : "user"}"/></svg>
+          ${stats.has_db ? "继续归档" : "登录百度账号"}
+        </button>
+      </div>
     </section>
 
     ${stats.has_db && stats.index_complete === false ? `
@@ -296,16 +302,28 @@ const PAGES = {
   export() {
     const n = selected.size;
     return `
+    <section class="hero export-hero">
+      <div>
+        <p class="eyebrow">EXPORT EVERYTHING</p>
+        <h2>一键导出全部</h2>
+        <p>生成一个完整的归档文件夹：双击「打开归档.html」就能浏览全部文章，图片随附，
+        另含 Markdown / TXT、WordPress 导入包和总目录。不依赖网络，百度关闭后依然能打开。</p>
+      </div>
+      <button class="btn-light" data-act="export-all" ${exporting ? "disabled" : ""}>
+        <svg width="15" height="15"><use href="#i-export"/></svg>${exporting ? "正在导出…" : "选择位置并导出"}
+      </button>
+    </section>
+    <p class="login-status" id="exportStatus">${esc(exportMessage)}</p>
+
     <article class="surface-card">
-      <div class="section-heading"><div><span class="eyebrow">EXPORT</span><h3>导出</h3></div>
+      <div class="section-heading"><div><span class="eyebrow">PARTIAL</span><h3>按需导出</h3></div>
         <span class="sel-count">${n ? `已选 ${n} 篇` : "未选择 = 全部"}</span></div>
       <p class="hint">导出只读取本地已校验的内容，不会发起任何网络请求。点击后会弹出系统目录选择器。</p>
       <div class="row"><div class="row-main"><strong>所选文章（ZIP）</strong><small>正文 HTML + 本地图片 + 元数据</small></div>
         <button class="btn-text" data-export="selection">选择目录</button></div>
       <div class="row"><div class="row-main"><strong>文章图片（ZIP）</strong><small>仅打包已下载的图片，未下载的写入清单</small></div>
         <button class="btn-text" data-export="images">选择目录</button></div>
-      <div class="row"><div class="row-main"><strong>Markdown / TXT / WXR / 静态站点</strong><small>这些格式目前由命令行提供</small></div>
-        <span class="hint-inline">baidu-archive export --format all</span></div>
+
     </article>`;
   },
 
@@ -328,6 +346,8 @@ const PAGES = {
           <button class="btn-text" data-act="login">打开登录窗口</button></div>
         <div class="row"><div class="row-main"><strong>测试连接</strong><small>真发一次列表请求验证可用性</small></div>
           <button class="btn-text" data-act="check-conn">测试</button></div>
+        <div class="row"><div class="row-main"><strong>退出登录</strong><small>删除本地保存的 Cookie，已归档的内容不受影响</small></div>
+          <button class="btn-text danger" data-act="logout">退出</button></div>
       ` : `
         <p class="hint">归档的是你本人账号的历史内容，需要先登录。
         点击下面的按钮会打开百度官方登录页，<strong>扫码或输入账密都由你自己在那个窗口完成</strong> ——
@@ -350,8 +370,12 @@ const PAGES = {
 
     <article class="surface-card">
       <div class="section-heading"><div><span class="eyebrow">SETTINGS</span><h3>设置</h3></div></div>
-      <div class="row"><div class="row-main"><strong>请求间隔</strong><small>面对遗留系统，可靠性优先于速度</small></div><strong>${esc(s.delay ?? "0.8")}s</strong></div>
-      <div class="row"><div class="row-main"><strong>并发数</strong><small>建议不超过 3</small></div><strong>${esc(s.concurrency ?? "2")}</strong></div>
+      <div class="row"><div class="row-main"><strong>请求间隔</strong><small>${Number(s.delay ?? 0.8) < 0.5
+          ? "当前偏快。面对遗留系统，建议不低于 0.8s" : "面对遗留系统，可靠性优先于速度"}</small></div>
+        <strong class="${Number(s.delay ?? 0.8) < 0.5 ? "value-warn" : ""}">${esc(s.delay ?? "0.8")}s</strong></div>
+      <div class="row"><div class="row-main"><strong>并发数</strong><small>${Number(s.concurrency ?? 2) > 3
+          ? "当前高于建议值 3，可能给旧服务带来压力" : "建议不超过 3"}</small></div>
+        <strong class="${Number(s.concurrency ?? 2) > 3 ? "value-warn" : ""}">${esc(s.concurrency ?? "2")}</strong></div>
       <div class="row"><div class="row-main"><strong>归档目录</strong><small>${esc(stats.root || "archive/")}</small></div>
         <button class="btn-text" data-act="reveal">在访达中显示</button></div>
     </article>`;
@@ -467,6 +491,7 @@ document.addEventListener("click", async (e) => {
   const act = e.target.closest("[data-act]");
   if (act) {
     const what = act.dataset.act;
+    if (accountMenu?.contains(act)) closeAccountMenu();   // 菜单项点完即收起
     if (what === "back") { reading = null; return render(); }
     if (what === "reload") { selected.clear(); await loadLibrary(true); return; }
     if (what === "clear-sel") { selected.clear(); return render(); }
@@ -474,7 +499,30 @@ document.addEventListener("click", async (e) => {
     if (what === "stop") { taskJob = await api("stop_task"); return render(); }
     if (what === "reveal") return api("reveal_archive");
 
+    if (what === "export-all") {
+      exporting = true; exportMessage = "正在生成归档包，文章多时需要一会儿…"; render();
+      const r = await api("export_all");
+      exporting = false;
+      exportMessage = r?.ok ? `已导出 ${r.articles} 篇文章 → ${r.path}${r.warnings?.length ? `（${r.warnings.join("；")}）` : ""}`
+                    : (r?.cancelled ? "" : `导出失败：${r?.error || "未知错误"}`);
+      return render();
+    }
+    if (what === "logout") {
+      const ok = await api("confirm", "退出百度登录？", "将删除本地保存的 Cookie。已归档的文章、图片与报告都不会受影响，随时可以重新登录。");
+      if (!ok) return;
+      const r = await api("logout");
+      if (!r?.ok) return setLoginStatus(r?.error || "退出失败", true);
+      closeAccountMenu();
+      await afterLogin();
+      setLoginStatus(r.env_cookie_still_set
+        ? "已删除本地 Cookie，但环境变量 BAIDU_ARCHIVE_COOKIE 仍在生效，需在终端里手动取消。"
+        : "已退出登录。");
+      return;
+    }
+    if (what === "account-settings") { closeAccountMenu(); return goto("settings"); }
+
     if (what === "login") {
+      closeAccountMenu();
       setLoginStatus("正在打开百度登录窗口，请在那个窗口里完成登录…");
       const r = await api("start_login");
       if (r && !r.ok) setLoginStatus("打不开登录窗口：" + (r.error || "未知错误"), true);
@@ -538,6 +586,54 @@ function applySystemTheme(isDark) {
 applySystemTheme(mq.matches);
 mq.addEventListener("change", (ev) => applySystemTheme(ev.matches));
 
+/* ---------- 账号区（右上角） ---------- */
+const accountBtn = document.getElementById("accountBtn");
+let accountMenu = null;
+
+function renderAccount() {
+  const name = document.getElementById("acctName");
+  const sub = document.getElementById("acctSub");
+  if (!name || !sub) return;
+  if (credential?.logged_in) {
+    name.textContent = "已登录百度";
+    sub.textContent = library?.connection?.state === "connected" ? "连接正常" : "点击管理账号";
+    accountBtn.classList.add("is-logged-in");
+  } else {
+    name.textContent = credential?.present ? "凭证可疑" : "尚未登录";
+    sub.textContent = "点击登录百度账号";
+    accountBtn.classList.remove("is-logged-in");
+  }
+}
+
+function closeAccountMenu() { accountMenu?.remove(); accountMenu = null; }
+
+accountBtn.addEventListener("click", async (e) => {
+  e.stopPropagation();
+  if (accountMenu) return closeAccountMenu();
+  if (!credential) credential = await api("credential_state");
+  if (!credential?.logged_in) {                     // 未登录：直接打开登录窗口
+    goto("settings");
+    setTimeout(() => document.querySelector('[data-act="login"]')?.click(), 50);
+    return;
+  }
+  accountMenu = document.createElement("div");
+  accountMenu.className = "account-menu";
+  accountMenu.innerHTML = `
+    <div class="account-menu-head"><strong>已登录百度</strong>
+      <small>${esc((credential.cookie_names || []).length)} 项 Cookie · 存于本机</small></div>
+    <button data-act="login">重新登录</button>
+    <button data-act="check-conn">测试连接</button>
+    <button data-act="account-settings">账号设置</button>
+    <button data-act="logout" class="danger">退出登录</button>`;
+  document.body.appendChild(accountMenu);
+  const rect = accountBtn.getBoundingClientRect();
+  accountMenu.style.top = `${rect.bottom + 8}px`;
+  accountMenu.style.right = `${window.innerWidth - rect.right}px`;
+});
+document.addEventListener("click", (e) => {
+  if (accountMenu && !accountMenu.contains(e.target)) closeAccountMenu();
+});
+
 /* ---------- 登录 ---------- */
 function setLoginStatus(text, isError = false) {
   const el = document.getElementById("loginStatus");
@@ -548,9 +644,11 @@ function setLoginStatus(text, isError = false) {
 
 async function afterLogin() {
   credential = await api("credential_state");
+  renderAccount();
   await loadLibrary(true);
   await refresh();
   render();
+  renderAccount();
 }
 
 /* 由 Python 在登录窗口拿到 Cookie 后调用 */
@@ -571,4 +669,8 @@ document.addEventListener("contextmenu", (e) => e.preventDefault());
 document.addEventListener("dragstart", (e) => e.preventDefault());
 
 render();
-window.addEventListener("pywebviewready", refresh);
+window.addEventListener("pywebviewready", async () => {
+  credential = await api("credential_state");
+  renderAccount();
+  await refresh();
+});

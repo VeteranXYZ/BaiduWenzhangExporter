@@ -564,3 +564,96 @@ def test_gui_export_writes_zip_into_chosen_directory(archive, monkeypatch, tmp_p
     result = api.export_to('images', ['one'])
     assert result['ok'] and Path(result['path']).parent == target
     assert Path(result['path']).suffix == '.zip' and Path(result['path']).is_file()
+
+
+def test_gui_export_selection_with_real_archive(archive, monkeypatch, tmp_path):
+    """回归：export_to('selection') 曾漏传 formats，按钮每次点击都抛 TypeError。
+    之前的测试只覆盖了 images 分支和取消分支，没走到这里。"""
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    download(cfg, state)
+    api = gui.Api(cfg)
+    monkeypatch.setattr(api, 'choose_directory', lambda: str(tmp_path))
+    monkeypatch.setattr(gui, '_notify', lambda *a: None)
+    result = api.export_to('selection', [])
+    assert result['ok'], result.get('error')
+    import zipfile
+    with zipfile.ZipFile(result['path']) as bundle:
+        names = bundle.namelist()
+    assert any(n.endswith('.md') for n in names) and any(n.endswith('.txt') for n in names)
+
+
+def _export_all(monkeypatch, cfg, target):
+    gui = _gui(monkeypatch)
+    api = gui.Api(cfg)
+    monkeypatch.setattr(api, 'choose_directory', lambda: str(target))
+    monkeypatch.setattr(gui, '_notify', lambda *a: None)
+    monkeypatch.setattr(gui, '_reveal', lambda *a: None)
+    return api
+
+
+def test_gui_export_all_builds_complete_offline_package(archive, monkeypatch, tmp_path):
+    """一键导出全部：一个文件夹，双击即可浏览，所有格式齐备。"""
+    cfg, state = archive
+    download(cfg, state)
+    result = _export_all(monkeypatch, cfg, tmp_path).export_all()
+    assert result['ok'], result.get('error')
+    package = Path(result['path'])
+    for name in ('打开归档.html', 'index.html', 'articles', '文本版-Markdown与TXT.zip',
+                 'WordPress导入.xml', '总目录.csv', '总目录.json', '说明.txt'):
+        assert (package / name).exists(), f'导出包缺少 {name}'
+    assert result['articles'] == 1 and not result['warnings']
+    # 图片随附且走相对路径，不依赖网络
+    article = next((package / 'articles').iterdir())
+    assert list(article.rglob('*.png'))
+    assert 'assets/' in (article / 'index.html').read_text(encoding='utf-8')
+
+
+def test_gui_export_all_never_overwrites_and_leaves_no_partial(archive, monkeypatch, tmp_path):
+    cfg, state = archive
+    download(cfg, state)
+    api = _export_all(monkeypatch, cfg, tmp_path)
+    first, second = api.export_all(), api.export_all()
+    assert first['ok'] and second['ok'] and first['path'] != second['path']
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith('.')]   # 无 .partial 残留
+
+
+def test_gui_export_all_skips_corrupted_images(archive, monkeypatch, tmp_path):
+    """损坏的图片不得打进导出包 —— 包里只放校验通过的字节。"""
+    cfg, state = archive
+    download(cfg, state)
+    (cfg.item_dir('one') / state.assets_for('one')[0]['local_path']).write_bytes(b'not a png')
+    result = _export_all(monkeypatch, cfg, tmp_path).export_all()
+    assert result['ok']
+    assert not list(Path(result['path']).rglob('*.png'))
+
+
+def test_gui_export_all_refuses_while_task_running(archive, monkeypatch, tmp_path):
+    cfg, state = archive
+    api = _export_all(monkeypatch, cfg, tmp_path)
+    monkeypatch.setattr(api, 'get_task', lambda: {'status': 'running'})
+    result = api.export_all()
+    assert not result['ok'] and '任务' in result['error']
+    # tmp_path 下本来就有夹具建的 archive/，只需确认没有生成任何导出包或半成品
+    assert not [p for p in tmp_path.iterdir() if '百度空间归档' in p.name]
+
+
+def test_gui_logout_keeps_endpoint_config(tmp_path, monkeypatch):
+    """退出登录只删 Cookie；列表端点、UA 必须保留，否则重新登录后接口地址就丢了。"""
+    import json
+    from baidu_archive.auth import clear_credentials, save_cookie_session, load_credentials
+    monkeypatch.delenv('BAIDU_ARCHIVE_COOKIE', raising=False)
+    save_cookie_session('BDUSS=FAKE', list_url_template='https://wenzhang.baidu.com/fav/list?start={start}&limit={limit}',
+                        user_agent='UA-KEEP', secrets_dir=tmp_path)
+    result = clear_credentials(secrets_dir=tmp_path)
+    saved = json.loads((tmp_path / 'session.json').read_text(encoding='utf-8'))
+    assert saved['cookie_header'] == '' and 'fav/list' in saved['list_url_template']
+    assert saved['user_agent'] == 'UA-KEEP'
+    assert not load_credentials(secrets_dir=tmp_path).present
+    assert result['env_cookie_still_set'] is False
+
+
+def test_gui_logout_reports_env_cookie_it_cannot_clear(tmp_path, monkeypatch):
+    from baidu_archive.auth import clear_credentials
+    monkeypatch.setenv('BAIDU_ARCHIVE_COOKIE', 'BDUSS=FROMENV')
+    assert clear_credentials(secrets_dir=tmp_path)['env_cookie_still_set'] is True

@@ -315,6 +315,37 @@ def save_cookie_session(
     }
 
 
+def clear_credentials(secrets_dir: Path = SECRETS_DIR) -> dict:
+    """退出登录：删除本地保存的 Cookie。
+
+    只抹掉 cookie_header，列表端点、User-Agent 等非敏感配置保留 ——
+    否则重新扫码后会丢失已确认的接口地址。cookies.txt 等旧式凭证文件直接删除。
+    环境变量 BAIDU_ARCHIVE_COOKIE 无法由程序清除，如有设置会在返回值中提示。
+    """
+    removed: list[str] = []
+    session_path = secrets_dir / "session.json"
+    if session_path.exists():
+        try:
+            session = json.loads(session_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            session = {}
+        if session.get("cookie_header"):
+            session["cookie_header"] = ""
+            from .storage import write_json_atomic
+
+            write_json_atomic(session_path, session)
+            removed.append(str(session_path))
+    for name in ("cookies.txt", "cookies.json", "cookies.netscape.txt"):
+        path = secrets_dir / name
+        if path.exists():
+            path.unlink()
+            removed.append(str(path))
+    return {
+        "removed": removed,
+        "env_cookie_still_set": bool(os.environ.get("BAIDU_ARCHIVE_COOKIE", "").strip()),
+    }
+
+
 def load_credentials(secrets_dir: Path = SECRETS_DIR) -> Credentials:
     """按优先级加载凭证。全部缺失时返回 ``present=False`` 的空凭证，不抛错。"""
     env_cookie = os.environ.get("BAIDU_ARCHIVE_COOKIE", "").strip()

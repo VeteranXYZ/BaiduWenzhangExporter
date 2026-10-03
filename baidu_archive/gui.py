@@ -395,13 +395,133 @@ class Api:
                 chosen = list(keys or [])
                 if not chosen:
                     chosen = [r["key"] for r in state.iter_records("page")]
-                runner = export_images if what == "images" else export_selection
-                result = runner(self.config, state, keys=chosen, output=target)
+                if what == "images":
+                    result = export_images(self.config, state, keys=chosen, output=target)
+                else:
+                    # export_selection 只接受 md/txt，与操作台（server.py）的调用保持一致。
+                    # 早先这里漏传 formats，导致「导出所选文章」每次都抛 TypeError。
+                    result = export_selection(self.config, state, keys=chosen,
+                                              formats=["md", "txt"], output=target)
             _notify("导出完成", f"{target.name} 已保存")
             return {"ok": True, "path": str(target), **(result or {})}
         except Exception as exc:  # noqa: BLE001
             _notify("导出失败", str(exc)[:120])
             return {"ok": False, "error": str(exc)[:200]}
+
+    def export_all(self) -> dict[str, Any]:
+        """一键导出全部：生成一个可以长期保存、离线打开的完整归档包。
+
+        用户最在意的就是这一件事 —— 把所有东西拿出来，百度关了也能看。
+        产物是一个文件夹而不是 ZIP，双击里面的「打开归档.html」就能浏览。
+
+            百度空间归档-20261003-1530/
+              打开归档.html          ← 双击即可浏览（按年份、可搜索、图片在本地）
+              index.html             同上（站点入口）
+              articles/              每篇一页，图片已随附
+              文本版-Markdown与TXT.zip
+              WordPress导入.xml
+              总目录.csv / 总目录.json   全部记录，保留原始顺序
+              说明.txt
+
+        只读取本地已校验通过的内容，不发任何网络请求；损坏或缺失的图片不会被
+        打进包里，但原始 URL 仍保留在正文与总目录中。
+        """
+        directory = self.choose_directory()
+        if not directory:
+            return {"ok": False, "cancelled": True}
+
+        job = self.get_task()
+        if job and job.get("status") in {"running", "starting", "stopping"}:
+            return {"ok": False, "error": "有任务正在进行，请等它结束或先停止后再导出"}
+
+        import shutil
+        from datetime import datetime
+
+        from .export import export_wxr
+        from .pipeline import export_master_index
+        from .selection import export_selection
+        from .site import export_reading_site
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M")
+        package = Path(directory) / f"百度空间归档-{stamp}"
+        suffix = 1
+        while package.exists():                  # 绝不覆盖已有导出
+            suffix += 1
+            package = Path(directory) / f"百度空间归档-{stamp}-{suffix}"
+        building = package.with_name("." + package.name + ".partial")
+        shutil.rmtree(building, ignore_errors=True)
+        building.mkdir(parents=True)
+
+        report: dict[str, Any] = {"articles": 0, "warnings": []}
+        try:
+            with ArchiveState(self.config.db_path) as state:
+                # 1) 可离线浏览的阅读站 —— 包的核心
+                report["articles"] = export_reading_site(self.config, state, building)
+                entry = building / "index.html"
+                if entry.exists():
+                    shutil.copyfile(entry, building / "打开归档.html")
+
+                # 2) Markdown / TXT
+                pages = [r["key"] for r in state.iter_records("page")]
+                if pages:
+                    try:
+                        export_selection(self.config, state, keys=pages, formats=["md", "txt"],
+                                         output=building / "文本版-Markdown与TXT.zip")
+                    except Exception as exc:  # noqa: BLE001 —— 派生格式失败不应毁掉整个包
+                        report["warnings"].append(f"Markdown/TXT 未生成：{exc}"[:160])
+
+                # 3) WordPress 迁移包
+                try:
+                    wxr = export_wxr(self.config, state)
+                    shutil.copyfile(wxr, building / "WordPress导入.xml")
+                except Exception as exc:  # noqa: BLE001
+                    report["warnings"].append(f"WordPress 导入包未生成：{exc}"[:160])
+
+                # 4) 总目录：全部记录（含外部收藏），保留原始顺序
+                export_master_index(self.config, state)
+                for src, dst in (("master_index.csv", "总目录.csv"), ("master_index.json", "总目录.json")):
+                    if (self.config.root / src).exists():
+                        shutil.copyfile(self.config.root / src, building / dst)
+
+                total = state.count_records()
+
+            (building / "说明.txt").write_text(
+                "百度空间归档 · 导出包\n"
+                f"生成时间：{datetime.now():%Y-%m-%d %H:%M}\n\n"
+                "打开归档.html          双击即可浏览全部文章（按年份分组、可搜索、图片在本地）\n"
+                "articles/              每篇文章一页，图片随附\n"
+                "文本版-Markdown与TXT.zip  纯文本格式，便于搜索或迁移到 Obsidian、Hugo 等\n"
+                "WordPress导入.xml      在 WordPress 后台「工具 → 导入 → WordPress」使用\n"
+                "总目录.csv / .json     全部收藏记录（含外部收藏），保留百度列表的原始顺序\n\n"
+                f"共 {total} 条记录，其中 {report['articles']} 篇文章可阅读。\n"
+                "本包只包含校验通过的内容；未能保存的图片在正文中显示为占位，原始地址仍保留。\n"
+                "整个文件夹不依赖网络，百度服务关闭后依然可以打开。\n",
+                encoding="utf-8",
+            )
+            building.rename(package)             # 全部写完才发布，中途失败不会留下半成品
+        except Exception as exc:  # noqa: BLE001
+            shutil.rmtree(building, ignore_errors=True)
+            _notify("导出失败", str(exc)[:120])
+            return {"ok": False, "error": str(exc)[:200]}
+
+        _notify("导出完成", f"{report['articles']} 篇文章已导出到 {package.name}")
+        _reveal(package / "打开归档.html" if (package / "打开归档.html").exists() else package)
+        return {"ok": True, "path": str(package), **report}
+
+    # ---------- 退出登录 ----------
+    def logout(self) -> dict[str, Any]:
+        """删除本地保存的百度 Cookie。已归档的内容完全不受影响。"""
+        job = self.get_task()
+        if job and job.get("status") in {"running", "starting", "stopping"}:
+            return {"ok": False, "error": "有任务正在进行，请先停止再退出登录"}
+        from .auth import clear_credentials
+
+        try:
+            result = clear_credentials()
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)[:200]}
+        self._application = None
+        return {"ok": True, **result}
 
     # ---------- 系统集成 ----------
     def choose_directory(self) -> str | None:
