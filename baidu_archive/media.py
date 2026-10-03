@@ -229,6 +229,21 @@ def _mp4_structure(body: bytes) -> tuple[str, str | None]:
         return 'rejected', None
 
 
+# 图床在原图被删除后，会返回一张结构完全合法的「图片不存在」占位图，HTTP 200。
+# 只看结构的话它会被当成下载成功 —— 实测某个真实归档里 219 张「已核实」图片中
+# 有 89 张其实是这一张占位图（200×200，4383 字节，字节完全相同），涉及 12 篇文章。
+# 按内容指纹识别：占位图本身仍原样保存在磁盘上，作为「原图已被删除」的证据。
+KNOWN_PLACEHOLDERS = {
+    "9aeb6ef45f38674f8552b598219929db3d310409229ef6048ab69a9db51786d7":
+        "百度图床「你查看的图片不存在」占位图",
+}
+
+
+def placeholder_reason(body: bytes) -> str | None:
+    import hashlib
+    return KNOWN_PLACEHOLDERS.get(hashlib.sha256(body).hexdigest())
+
+
 def validate_media_response(kind, body: bytes, content_type: str | None) -> dict:
     """Only proven structure contributes to complete. Bytes alone never do."""
     import io
@@ -247,6 +262,9 @@ def validate_media_response(kind, body: bytes, content_type: str | None) -> dict
         allowed = not mime or mime.startswith('image/') or mime in {'application/octet-stream','binary/octet-stream','text/plain','application/xml','text/xml'}
         if not extension or not allowed: return result('rejected', reason='not_an_image')
         status = _image_structure(body, extension)
+        if status == 'accepted' and placeholder_reason(body):
+            # 结构合法但内容是「图片不存在」：原图已被删除，不能算作保存成功
+            return result('placeholder', reason='source_deleted_placeholder')
         return result(status, extension if status == 'accepted' else None, None if status == 'accepted' else 'invalid_image_structure')
     if kind not in {'audio','video','media-source'}:
         return result('unverifiable', reason='unsupported_media_kind')

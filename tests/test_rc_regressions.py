@@ -657,3 +657,168 @@ def test_gui_logout_reports_env_cookie_it_cannot_clear(tmp_path, monkeypatch):
     from baidu_archive.auth import clear_credentials
     monkeypatch.setenv('BAIDU_ARCHIVE_COOKIE', 'BDUSS=FROMENV')
     assert clear_credentials(secrets_dir=tmp_path)['env_cookie_still_set'] is True
+
+
+def test_config_file_page_limit_is_ignored(tmp_path, monkeypatch):
+    """回归：config.json 里的 page_limit=100 让索引永远无法离线核实
+    （已存原始页按 0/30/60… 存放，limit 对不上就报 unexpected_limit）。"""
+    import json
+    from baidu_archive.config import BAIDU_PAGE_LIMIT, load_config
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / 'config.json').write_text(json.dumps({'page_limit': 100, 'delay': 1.5}))
+    cfg = load_config()
+    assert cfg.page_limit == BAIDU_PAGE_LIMIT == 30
+    assert cfg.delay == 1.5                              # 其他设置照常生效
+    assert 'page_limit' in cfg.ignored_settings
+
+
+# ---------------- 梳理：离线修复 / 问题分组 / 图片墙 ----------------
+
+def _legacy_archive(cfg, state):
+    """模拟旧版本留下的归档：图片字节都在，但缺少新版的身份校验记录，索引也没有 generation。"""
+    download(cfg, state)
+    for asset in state.assets_for('one'):
+        state.record_asset_result('one', asset['original_url'], asset['attribute'], download_identity=None)
+    state.set_meta('index_generation', None)
+
+
+def test_repair_offline_recovers_legacy_archive_without_network(archive, monkeypatch):
+    """旧版本归档：文件都在却被判为不可信。离线修复必须救回来，且一次网络请求都不发。"""
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    _legacy_archive(cfg, state)
+    api = gui.Api(cfg)
+    monkeypatch.setattr(api, 'get_task', lambda: None)
+
+    sent = []
+    real = gui._offline_client
+    def spying(config):
+        client = real(config)
+        original = client._client.send
+        client._client.send = lambda request, **kw: sent.append(str(request.url)) or original(request, **kw)
+        return client
+    monkeypatch.setattr(gui, '_offline_client', spying)
+
+    assert api.health()['needs_offline_repair'] is True
+    result = api.repair_offline()
+    assert result['ok'], result
+    assert result['after']['complete'] == 1 and result['after']['index_complete'] is True
+    assert result['after']['assets_downloaded'] == 1
+    assert sent == [], f'离线修复不得联网，实际请求了 {sent}'
+    assert api.health()['needs_offline_repair'] is False
+
+
+def test_repair_offline_keeps_original_failure_reason_of_dead_images(archive, monkeypatch):
+    """含失败图片的文章不能被交给离线重试 —— 否则 HTTP 504 之类的原始失败原因会被覆盖。"""
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    with transport(cfg, lambda r: httpx.Response(504)) as client:
+        run_assets(cfg, state, client)
+    before = state.assets_for('one')[0]
+    assert before['download_status'] == 'failed' and before['http_status'] == 504
+    api = gui.Api(cfg); monkeypatch.setattr(api, 'get_task', lambda: None)
+    assert api.repair_offline()['ok']
+    after = state.assets_for('one')[0]
+    assert after['http_status'] == 504 and after['error'] == before['error']
+
+
+def test_repair_refuses_while_task_running(archive, monkeypatch):
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    api = gui.Api(cfg); monkeypatch.setattr(api, 'get_task', lambda: {'status': 'running'})
+    assert not api.repair_offline()['ok']
+
+
+def test_problems_group_dead_images_with_plain_reason(archive, monkeypatch):
+    """死链图片归到「无法找回」，并给出人话原因，而不是只给一个重试按钮。"""
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    with transport(cfg, lambda r: httpx.Response(504)) as client:
+        run_assets(cfg, state, client)
+    groups = gui.Api(cfg).get_problems()
+    assert [g['key'] for g in groups['dead_images']] == ['one']
+    image = groups['dead_images'][0]['images'][0]
+    assert image['url'] == 'photo.png' and '停止运营' in image['reason']
+    assert groups['not_saved'] == [] and groups['unverified'] == []
+
+
+@pytest.mark.parametrize('asset,expected', [
+    ({'http_status': 404}, '已被删除'),
+    ({'http_status': 403}, '拒绝访问'),
+    ({'http_status': 504}, '停止运营'),
+    ({'http_status': 200, 'error': '响应不是可识别的图片；原始响应已保存'}, '网页而不是图片'),
+    ({'http_status': None, 'error': 'ConnectError: ...'}, '无法连接'),
+])
+def test_plain_failure_reason(monkeypatch, asset, expected):
+    assert expected in _gui(monkeypatch)._plain_failure(asset)
+
+
+def test_images_page_lists_only_verified_and_thumbnails_are_bytes_checked(archive, monkeypatch):
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    download(cfg, state)
+    api = gui.Api(cfg)
+    listed = api.get_images()
+    assert [i['key'] for i in listed] == ['one']
+    thumb = api.get_thumbnail(listed[0]['id'])
+    assert thumb and thumb.startswith('data:image/')
+    # 字节损坏后：不再列出，也不再生成缩略图（新建 Api，避免内存缓存）
+    (cfg.item_dir('one') / state.assets_for('one')[0]['local_path']).write_bytes(b'broken')
+    fresh = gui.Api(cfg)
+    assert fresh.get_images() == []
+    assert fresh.get_thumbnail(listed[0]['id']) is None
+
+
+def test_health_flags_risky_download_settings(archive, monkeypatch):
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    cfg.concurrency, cfg.delay = 4, 0.25
+    warnings = gui.Api(cfg).health()['settings_warnings']
+    assert any('并发' in w for w in warnings) and any('间隔' in w for w in warnings)
+
+
+# ---------------- 图床占位图 ----------------
+
+def _as_placeholder(monkeypatch, body):
+    """把一张合成图登记为占位图。真实的百度占位图属于第三方资源，不放进仓库。"""
+    import hashlib
+    from baidu_archive import media
+    monkeypatch.setitem(media.KNOWN_PLACEHOLDERS, hashlib.sha256(body).hexdigest(), '测试占位图')
+
+
+def test_known_placeholder_is_not_an_accepted_image(monkeypatch):
+    from baidu_archive.media import validate_media_response
+    assert validate_media_response('image', PNG, 'image/png')['status'] == 'accepted'
+    _as_placeholder(monkeypatch, PNG)
+    result = validate_media_response('image', PNG, 'image/png')
+    assert result['status'] == 'placeholder' and result['reason'] == 'source_deleted_placeholder'
+
+
+def test_downloaded_placeholder_is_not_counted_as_saved(archive, monkeypatch):
+    """回归：图床把删除的原图换成「图片不存在」占位图并返回 200。只看结构会把它当成
+    下载成功 —— 真实归档里 219 张「已核实」图片中有 89 张其实是同一张占位图。"""
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    download(cfg, state)                      # 先按旧逻辑「成功」下载
+    _as_placeholder(monkeypatch, PNG)         # 之后识别出它是占位图
+    asset = state.assets_for('one')[0]
+    assert not validate_downloaded_asset(cfg, asset)['ok']
+    assert not article_truth(cfg, state, 'one')['complete']
+    api = gui.Api(cfg)
+    assert api.get_images() == []             # 不出现在图片墙
+    groups = api.get_problems()
+    assert [g['key'] for g in groups['baidu_deleted']] == ['one']
+    assert '占位图' in groups['baidu_deleted'][0]['images'][0]['reason']
+    assert groups['dead_images'] == []
+    # 占位图文件仍原样保留在磁盘上，作为「原图已被删除」的证据
+    assert (cfg.item_dir('one') / asset['local_path']).read_bytes() == PNG
+
+
+def test_placeholder_at_download_time_is_kept_as_evidence(archive, monkeypatch):
+    _as_placeholder(monkeypatch, PNG)
+    cfg, state = archive
+    download(cfg, state)
+    asset = state.assets_for('one')[0]
+    assert asset['download_status'] == 'failed' and 'placeholder' in asset['error']
+    kept = list((cfg.raw_dir / 'asset_responses').rglob('*.bin'))
+    assert kept and kept[0].read_bytes() == PNG

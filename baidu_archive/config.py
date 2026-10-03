@@ -28,6 +28,11 @@ LIST_URL_CANDIDATES = (
     f"{SITE_ROOT}/page/getlist?start={{start}}&limit={{limit}}",
 )
 
+# 列表接口每页条数由百度决定，实测固定为 30。它不是可调参数：
+# 一旦与已保存的原始列表页（按 0/30/60… 存放）对不上，索引就永远无法离线核实，
+# 每次都会报 unexpected_limit。所以配置文件与环境变量里的 page_limit 一律忽略。
+BAIDU_PAGE_LIMIT = 30
+
 DETAIL_URL_TEMPLATE = f"{SITE_ROOT}/page/view?key={{key}}"
 ARTICLE_URL_TEMPLATE = f"{SITE_ROOT}/article/view?key={{key}}"
 
@@ -43,7 +48,9 @@ class Config:
     article_url_template: str = ARTICLE_URL_TEMPLATE
     user_agent: str = DEFAULT_USER_AGENT
     referer: str = f"{SITE_ROOT}/"
-    page_limit: int = 30
+    page_limit: int = BAIDU_PAGE_LIMIT
+    # 被忽略的配置项及原因，界面据此提示用户
+    ignored_settings: dict[str, str] = field(default_factory=dict)
 
     # 请求策略 —— 面对遗留系统，可靠性优先于速度。
     concurrency: int = 2
@@ -120,13 +127,12 @@ class Config:
         return template.format(key=key)
 
     def list_url(self, start: int, limit: int | None = None) -> str:
-        if not self.list_url_template:
-            raise RuntimeError(
-                "列表接口 URL 未配置。请先运行 `baidu-archive import-curl <file>` 导入，"
-                "或用 `baidu-archive doctor --probe` 自动探测。"
-            )
+        # 端点已确认且固定，未单独配置时直接用它。否则在凭证文件缺失、
+        # 只用环境变量提供 Cookie 时，连「复用已存原始页、完全不联网」的
+        # 索引重建都会因为拼不出 URL 而失败。
+        template = self.list_url_template or LIST_URL_CANDIDATES[0]
         # ts 始终提供：模板里没有 {ts} 时 format 会忽略它
-        return self.list_url_template.format(
+        return template.format(
             start=start, limit=limit or self.page_limit, ts=int(time.time() * 1000)
         )
 
@@ -162,6 +168,13 @@ def load_config(root: str | os.PathLike[str] | None = None, config_file: str | o
             if key == "root":
                 if not root:
                     cfg.root = Path(value)
+            elif key == "page_limit":
+                if value != BAIDU_PAGE_LIMIT:
+                    cfg.ignored_settings["page_limit"] = (
+                        f"配置文件中的每页条数 {value} 已忽略：百度接口固定每页 {BAIDU_PAGE_LIMIT} 条"
+                    )
+            elif key == "ignored_settings":
+                continue
             elif hasattr(cfg, key):
                 setattr(cfg, key, value)
 
@@ -189,6 +202,8 @@ def load_config(root: str | os.PathLike[str] | None = None, config_file: str | o
                 if not root:
                     cfg.root = Path(os.environ[env_name])
             elif isinstance(current, (dict, list)):
+                continue
+            elif name == "page_limit":
                 continue
             else:
                 setattr(cfg, name, _coerce(os.environ[env_name], current))

@@ -107,7 +107,9 @@ def test_loopback_host_origin_and_mutation_token_are_required(http):
 
 def test_settings_persist_and_reject_out_of_bounds(application):
     result = application.save_settings({'concurrency': 4, 'delay': .25, 'page_limit': 100})
-    assert result['page_limit'] == 100
+    # 每页条数不再可调：百度固定 30，改成别的值会让索引永远无法核实
+    assert result['page_limit'] == 30
+    assert 'page_limit' not in json.loads(application.config_file.read_text())
     assert json.loads(application.config_file.read_text())['delay'] == .25
     with pytest.raises(server.InputError):
         application.save_settings({'concurrency': 100, 'delay': 0, 'page_limit': -1})

@@ -129,12 +129,13 @@ class Application:
 
     def save_settings(self, data):
         values = {}
-        for name, low, high, kind in [('concurrency', 1, 8, int), ('delay', .1, 10, float), ('page_limit', 1, 100, int)]:
+        # page_limit 不再可调：百度接口固定每页 30 条，改了只会让索引永远无法核实。
+        for name, low, high, kind in [('concurrency', 1, 8, int), ('delay', .1, 10, float)]:
             value = data.get(name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high:
                 raise InputError(f'{name} 需在 {low}–{high} 范围内')
             if kind is int and int(value) != value:
-                raise InputError('并发和每页条数必须为整数')
+                raise InputError('并发数必须为整数')
             values[name] = kind(value)
         with self.lock, ArchiveLock(self.config.root):
             if self.job and self.job['status'] in ACTIVE:

@@ -72,6 +72,49 @@ def _notify(title: str, message: str) -> None:
         subprocess.run(["notify-send", title, message], check=False, capture_output=True)
 
 
+def _offline_client(config: Config):
+    """一个拒绝任何网络请求的客户端，用于离线修复。
+
+    修复流程复用 run_index / run_assets，它们需要一个 client 参数；
+    这里给的 client 一旦被要求联网就直接报错，保证「离线修复」名副其实。
+    """
+    import httpx
+
+    from .auth import Credentials
+    from .client import ArchiveClient
+
+    def refuse(request):
+        raise httpx.ConnectError("离线修复不发网络请求", request=request)
+
+    client = ArchiveClient(config, Credentials())
+    client._client.close()
+    client._client = httpx.Client(transport=httpx.MockTransport(refuse))
+    return client
+
+
+def _plain_failure(asset: dict[str, Any]) -> str:
+    """把图片下载失败的技术原因翻译成人话。原始错误仍完整保存在数据库与 raw 里。"""
+    error = (asset.get("error") or "").lower()
+    code = asset.get("http_status")
+    if asset.get("validation_reason") == "invalid_media_placeholder" or "placeholder" in error:
+        return "百度已删除原图，只返回了一张「图片不存在」占位图"
+    if "不是可识别的图片" in (asset.get("error") or ""):
+        return "原网站返回的是网页而不是图片（图片已失效，常见于图床关闭或改为占位图）"
+    if code == 404:
+        return "原图已被删除"
+    if code in (401, 403):
+        return "原网站拒绝访问（防盗链或已关闭）"
+    if isinstance(code, int) and 500 <= code < 600:
+        return "原网站服务器出错或已停止运营"
+    if isinstance(code, int) and 400 <= code < 500:
+        return "原网站拒绝了请求"
+    if "connect" in error or "name" in error or "resolve" in error:
+        return "原网站已无法连接（很可能已关闭）"
+    if "timeout" in error or "超时" in error:
+        return "原网站长时间无响应"
+    return asset.get("error") or "下载失败"
+
+
 def _reveal(path: Path) -> None:
     """在文件管理器中定位。"""
     try:
@@ -507,6 +550,230 @@ class Api:
         _notify("导出完成", f"{report['articles']} 篇文章已导出到 {package.name}")
         _reveal(package / "打开归档.html" if (package / "打开归档.html").exists() else package)
         return {"ok": True, "path": str(package), **report}
+
+    # ---------- 健康检查与离线修复 ----------
+    def _busy(self) -> bool:
+        job = self.get_task()
+        return bool(job and job.get("status") in {"running", "starting", "stopping"})
+
+    def health(self) -> dict[str, Any]:
+        """告诉界面「归档现在有什么需要处理」，并给出对应的处理方式。
+
+        区分三类：可离线修复的（旧数据待校验、索引待核实）、需要联网的
+        （正文没下载、登录失效）、无法挽回的（图片所在网站已失效）。
+        """
+        from .truth import index_truth, resource_state
+
+        report: dict[str, Any] = {
+            "has_db": self.config.db_path.exists(),
+            "ignored_settings": dict(self.config.ignored_settings),
+            "settings_warnings": [],
+            "needs_offline_repair": False,
+        }
+        if self.config.concurrency > 3:
+            report["settings_warnings"].append(f"并发数 {self.config.concurrency} 高于建议值 3")
+        if self.config.delay < 0.5:
+            report["settings_warnings"].append(f"请求间隔 {self.config.delay}s 低于建议值 0.8s")
+        if not report["has_db"]:
+            return report
+        try:
+            with ArchiveState(self.config.db_path) as state:
+                index = index_truth(state)
+                legacy_assets = sum(
+                    1 for a in state.all_assets()
+                    if a.get("download_status") == "ok" and resource_state(self.config, a)["state"] == "legacy_unverified"
+                )
+                raw_pages = len([p for p in self.config.lists_dir.glob("list_start*.json")
+                                 if not p.name.endswith((".meta.json", ".latest.json"))])
+            report.update({
+                "index_ok": index["ok"],
+                "index_reason": index["reason"],
+                "legacy_assets": legacy_assets,
+                "raw_list_pages": raw_pages,
+                # 有已存的原始列表页，就能离线重建索引证明；有旧资源就能离线补证
+                "needs_offline_repair": bool(legacy_assets or (not index["ok"] and raw_pages)),
+            })
+        except Exception as exc:  # noqa: BLE001
+            report["error"] = str(exc)[:200]
+        return report
+
+    def repair_offline(self) -> dict[str, Any]:
+        """一键修复旧数据：全程离线，不发任何网络请求。
+
+        旧版本抓下来的内容都还在磁盘上，只是缺少新版要求的校验记录，
+        于是被一律判为「不可信」。这里按 RAW FIRST 的设计，从已保存的原始数据补齐：
+
+          1. 补证：逐个核对已下载图片的字节，补写校验记录
+          2. 重建索引证明：复用已保存的原始列表页，证明收藏一条不漏
+          3. 重新评估：只处理图片已全部就绪的文章，把状态更新为「完整」
+
+        第 3 步刻意排除含失败图片的文章 —— 离线状态下重试必然失败，
+        会把它们原本的失败原因（如 HTTP 504）覆盖掉，而失败本身也是档案信息。
+        """
+        if self._busy():
+            return {"ok": False, "error": "有任务正在进行，请等它结束后再修复"}
+        from .assets import run_assets
+        from .legacy import rebuild_legacy_evidence
+        from .locking import ArchiveLock
+        from .pipeline import run_index
+
+        steps: dict[str, Any] = {}
+        before = self.get_verified_stats()
+        client = _offline_client(self.config)
+        try:
+            with ArchiveLock(self.config.root), ArchiveState(self.config.db_path) as state:
+                steps["legacy"] = rebuild_legacy_evidence(self.config, state)
+                try:
+                    run_index(self.config, state, client, force=False)
+                    steps["index"] = "ok"
+                except Exception as exc:  # noqa: BLE001 —— 原始页不全时会想联网，离线客户端会拦下
+                    steps["index"] = f"原始列表页不完整，需要联网更新一次收藏列表（{type(exc).__name__}）"
+
+                ready = []
+                for record in state.iter_records("page"):
+                    images = [a for a in state.assets_for(record["key"]) if a.get("kind") == "image"]
+                    if all(a.get("download_status") == "ok" for a in images):
+                        ready.append(record["key"])
+                if ready:
+                    run_assets(self.config, state, client, only_keys=ready)
+                steps["reevaluated"] = len(ready)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)[:200], "steps": steps}
+        finally:
+            client.close()
+
+        self._application = None
+        after = self.get_verified_stats()
+        return {"ok": True, "before": before, "after": after, "steps": steps}
+
+    def get_problems(self) -> dict[str, Any]:
+        """按「原因」而不是按「状态码」分组，每组配上对症的处理方式。"""
+        from .truth import article_truth, resource_state
+
+        groups: dict[str, list[dict[str, Any]]] = {
+            "baidu_deleted": [],   # 百度图床删了原图，只给「图片不存在」占位图
+            "dead_images": [],     # 第三方网站已失效：无法挽回，只保留原址
+            "not_saved": [],       # 正文没下载下来：可以重新下载
+            "auth": [],            # 登录失效导致的失败：重新登录后再下载
+            "unverified": [],      # 旧数据待校验：一键离线修复
+        }
+        if not self.config.db_path.exists():
+            return groups
+        with ArchiveState(self.config.db_path) as state:
+            for record in state.iter_records("page"):
+                key = record["key"]
+                item = state.get_item(key) or {}
+                facts = article_truth(self.config, state, key)
+                base = {"key": key, "title": record.get("title") or "无标题",
+                        "date": record.get("list_date") or ""}
+                if item.get("status") == "auth_error":
+                    groups["auth"].append(base)
+                    continue
+                if not facts["available"]:
+                    groups["not_saved"].append({**base, "error": (item.get("last_error") or "")[:120]})
+                    continue
+                dead, deleted = [], []
+                for asset in state.assets_for(key):
+                    if asset.get("kind") != "image":
+                        continue
+                    resource = resource_state(self.config, asset)
+                    if resource["state"] == "legacy_unverified":
+                        groups["unverified"].append(base)
+                        dead = deleted = None
+                        break
+                    if resource["state"] == "verified":
+                        continue
+                    if not (asset.get("download_attempted") or asset.get("download_status") == "ok"):
+                        continue          # 还没尝试过下载，不算「无法找回」
+                    entry = {
+                        "url": asset.get("original_url"),
+                        "domain": asset.get("domain") or "",
+                        "reason": _plain_failure({**asset, "validation_reason": resource["reason"]}),
+                    }
+                    # 字节已下载、结构也合法，却被识别为占位图 = 百度删了原图
+                    is_placeholder = resource["reason"] == "invalid_media_placeholder" or "placeholder" in (asset.get("error") or "")
+                    (deleted if is_placeholder else dead).append(entry)
+                if deleted:
+                    groups["baidu_deleted"].append({**base, "images": deleted})
+                if dead:
+                    groups["dead_images"].append({**base, "images": dead})
+        return groups
+
+    def get_images(self) -> list[dict[str, Any]]:
+        """图片页数据：只列校验通过的本地图片。缩略图另由 get_thumbnail 按需生成。"""
+        from .truth import validate_downloaded_asset
+
+        out: list[dict[str, Any]] = []
+        if not self.config.db_path.exists():
+            return out
+        with ArchiveState(self.config.db_path) as state:
+            for record in state.iter_records("page"):
+                for asset in state.assets_for(record["key"]):
+                    if asset.get("kind") != "image" or asset.get("download_status") != "ok":
+                        continue
+                    if not validate_downloaded_asset(self.config, asset)["ok"]:
+                        continue
+                    out.append({
+                        "id": asset["id"], "key": record["key"],
+                        "title": record.get("title") or "无标题",
+                        "date": record.get("list_date") or "",
+                    })
+        return out
+
+    def get_thumbnail(self, asset_id: int, size: int = 320) -> str | None:
+        """生成缩略图（data URI）。只用校验通过的字节；结果缓存在内存里。"""
+        cache = self.__dict__.setdefault("_thumbs", {})
+        if asset_id in cache:
+            return cache[asset_id]
+        import base64
+        import io
+
+        from PIL import Image
+
+        from .truth import validate_downloaded_asset
+
+        with ArchiveState(self.config.db_path) as state:
+            asset = next((a for a in state.all_assets() if a["id"] == asset_id), None)
+            if not asset or not validate_downloaded_asset(self.config, asset)["ok"]:
+                return None
+            path = self.config.item_dir(asset["key"]) / asset["local_path"]
+        try:
+            with Image.open(path) as image:
+                image.thumbnail((size, size))
+                if image.mode not in ("RGB", "L"):
+                    image = image.convert("RGB")
+                buffer = io.BytesIO()
+                image.save(buffer, "JPEG", quality=82)
+        except Exception:  # noqa: BLE001 —— GIF/SVG 等无法缩略时退回原图
+            try:
+                import mimetypes
+                body = path.read_bytes()
+                if len(body) > 2 * 1024 * 1024:
+                    return None
+                mime = mimetypes.guess_type(path.name)[0] or "image/png"
+                result = f"data:{mime};base64," + base64.b64encode(body).decode()
+                cache[asset_id] = result
+                return result
+            except OSError:
+                return None
+        result = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
+        cache[asset_id] = result
+        return result
+
+    def reset_recommended_settings(self) -> dict[str, Any]:
+        """把并发与请求间隔恢复为对旧服务友好的推荐值。"""
+        if self._busy():
+            return {"ok": False, "error": "有任务正在进行，请等它结束后再修改"}
+        try:
+            from .config import BAIDU_PAGE_LIMIT
+
+            settings = self._app().save_settings({"concurrency": 2, "delay": 0.8})
+            self.config.concurrency, self.config.delay = 2, 0.8
+            self.config.page_limit = BAIDU_PAGE_LIMIT
+            self.config.ignored_settings.pop("page_limit", None)
+            return {"ok": True, "settings": settings}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)[:200]}
 
     # ---------- 退出登录 ----------
     def logout(self) -> dict[str, Any]:
