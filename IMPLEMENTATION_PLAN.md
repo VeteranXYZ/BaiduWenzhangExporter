@@ -1,5 +1,9 @@
 # IMPLEMENTATION_PLAN
 
+> 2026-09-15：登录、全量 504 条索引与 497 篇正文归档已跑通。
+> 最新实测状态、剩余限制与下一阶段设计见 [TAKEOVER_PROGRESS.md](TAKEOVER_PROGRESS.md)。
+> 后续指示：暂停 UI，以指定 QzoneArchive 版本为未来参考；当前核心版本保护方案见 [CORE_DESIGN.md](CORE_DESIGN.md)。
+
 百度空间历史内容抢救 / 归档工具（`baidu_archive`）实施计划。
 
 目标不是"爬虫"，而是一个 **REPRODUCIBLE / RESUMABLE / VERIFIABLE / LOSS-MINIMIZING** 的本地数字档案。
@@ -71,12 +75,12 @@
 | `storage.py` | 原子写、SHA-256、raw 归档布局、item 目录布局 |
 | `state.py` | SQLite 状态机（records / items / assets / failures / runs / meta） |
 | `parsers.py` | **纯函数**：list HTML / detail HTML / content HTML / 资源 URL 提取 |
-| `models.py` | dataclass：`IndexRecord` `ItemState` `AssetRecord` `FetchResult` |
-| `indexer.py` | index 阶段：翻页、落 raw、建 master index |
-| `fetcher.py` | fetch 阶段：detail → iframe → content |
-| `parse_stage.py` | parse 阶段：raw → metadata.json + content.original.html |
+| `pipeline.py` | index / fetch / parse 三阶段，抓取与离线解析解耦 |
 | `assets.py` | 资源发现、下载、去重、content.local.html 重写 |
 | `export.py` | Markdown / TXT / WXR / 静态站点 |
+| `selection.py` | 选择文章的离线 ZIP 导出与逐文件校验清单 |
+| `tasks.py` / `locking.py` | 有限并发、停止控制、归档目录进程锁 |
+| `integrity.py` | 原件、版本引用、派生正文和资源摘要核验 |
 | `verify.py` | 完整性校验与报告生成 |
 | `utils.py` | `redact_url()` / `sanitize_filename()` / URL 解析 / Content-Type→扩展名 |
 | `cli.py` | argparse 子命令 |
@@ -107,7 +111,8 @@ pending
 | `warning` | 抓到了但内容可疑（正文为空/极短） | 是 |
 | `skipped_non_page` | article/other，第一阶段不抓正文 | — |
 
-状态推进是**单调**的：已经 `complete` 的 item 再次运行直接 `[SKIP] already complete`。
+同一正文版本内状态单调推进；新 raw 版本使派生阶段重新开始，历史文件保留。
+已经 `complete` 且原始摘要未变的条目可跳过。
 
 **原子性**：SQLite 本身事务保证；所有文件写入走 `write_atomic()`（临时文件 + `fsync` + `os.replace`）。
 

@@ -14,6 +14,8 @@ import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
+from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
+from urllib.request import Request
 
 SECRETS_DIR = Path("secrets")
 SESSION_FILE = SECRETS_DIR / "session.json"
@@ -49,14 +51,25 @@ class Credentials:
     referer: str | None = None
     extra_headers: dict[str, str] = field(default_factory=dict)
     source: str = "none"
+    cookie_jar: CookieJar | None = None
 
     @property
     def present(self) -> bool:
-        return bool(self.cookie_header.strip())
+        return self.available_for('https://wenzhang.baidu.com/fav/list')
 
-    def cookie_names(self) -> list[str]:
+    def available_for(self, url: str) -> bool:
+        return bool(self.header_for(url))
+
+    def header_for(self, url: str) -> str:
+        if self.cookie_jar is None:
+            return self.cookie_header
+        request = Request(url)
+        self.cookie_jar.add_cookie_header(request)
+        return request.get_header('Cookie') or ''
+
+    def cookie_names(self, url: str = "https://wenzhang.baidu.com/fav/list") -> list[str]:
         names = []
-        for chunk in self.cookie_header.split(";"):
+        for chunk in self.header_for(url).split(";"):
             name, _, _ = chunk.strip().partition("=")
             if name:
                 names.append(name)
@@ -87,17 +100,46 @@ def _cookies_from_json(text: str) -> str:
     return "; ".join(parts)
 
 
-def _cookies_from_netscape(text: str) -> str:
-    """Netscape cookies.txt 格式（7 列 TAB 分隔）。"""
-    parts = []
+def parse_netscape_cookies(text: str) -> CookieJar:
+    """Keep all seven fields; stdlib CookieJar applies domain/path/expiry/security.
+
+    DomainStrictNonDomain also enforces the Netscape FALSE (host-only) flag.
+    Malformed rows are ignored; ordinary comments never become cookies.
+    """
+    jar = CookieJar(policy=DefaultCookiePolicy(strict_ns_domain=DefaultCookiePolicy.DomainStrictNonDomain))
     for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+        line = line.lstrip(' ')
+        http_only = line.startswith('#HttpOnly_')
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif not line.strip() or line.startswith("#"):
             continue
         fields = line.split("\t")
-        if len(fields) >= 7 and fields[5]:
-            parts.append(f"{fields[5]}={fields[6]}")
-    return "; ".join(parts)
+        if len(fields) != 7:
+            continue
+        domain, flag, path, secure, expiry, name, value = fields
+        if (flag not in {'TRUE', 'FALSE'} or secure not in {'TRUE', 'FALSE'} or
+                not re.fullmatch(r'\.?[A-Za-z0-9.-]+', domain) or not path.startswith('/') or
+                not re.fullmatch(r'[!#$%&\x27*+.^_`|~0-9A-Za-z-]+', name) or
+                any(ord(c) < 32 or ord(c) > 126 or c == ';' for c in value)):
+            continue
+        try:
+            expires = int(expiry)
+        except ValueError:
+            continue
+        if expires < 0:
+            continue
+        domain = domain if flag == 'TRUE' else domain.lstrip('.')
+        jar.set_cookie(Cookie(0, name, value, None, False, domain, flag == 'TRUE',
+                              domain.startswith('.'), path, True, secure == 'TRUE',
+                              expires or None, expires == 0, None, None,
+                              {'HttpOnly': None} if http_only else {}, False))
+    return jar
+
+
+def _cookies_from_netscape(text: str) -> str:
+    """Compatibility helper: return only cookies valid for the collection URL."""
+    return Credentials(cookie_jar=parse_netscape_cookies(text)).header_for('https://wenzhang.baidu.com/')
 
 
 def parse_curl(curl_text: str) -> dict:
@@ -207,12 +249,10 @@ def import_curl(curl_text: str, *, secrets_dir: Path = SECRETS_DIR) -> dict:
         "extra_headers": {k: v for k, v in parsed["headers"].items() if k not in {"user-agent", "referer"}},
     }
     path = secrets_dir / "session.json"
-    blob = json.dumps(session, ensure_ascii=False, indent=2)
-    # 先建文件并收紧权限，再写内容，避免出现"内容已落盘但仍是 644"的窗口
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(blob + "\n")
-    os.chmod(path, 0o600)
+    from .storage import write_json_atomic
+
+    # mkstemp 创建的临时文件权限为 0600；原子替换也能安全更新已有会话。
+    write_json_atomic(path, session)
 
     from .utils import redact_url
 
@@ -250,10 +290,12 @@ def load_credentials(secrets_dir: Path = SECRETS_DIR) -> Credentials:
     for path, loader in (
         (secrets_dir / "cookies.txt", lambda t: t.strip()),
         (secrets_dir / "cookies.json", _cookies_from_json),
-        (secrets_dir / "cookies.netscape.txt", _cookies_from_netscape),
+        (secrets_dir / "cookies.netscape.txt", None),
     ):
         if path.exists():
             text = path.read_text(encoding="utf-8")
+            if loader is None:
+                return Credentials(cookie_jar=parse_netscape_cookies(text), source=str(path))
             cookie = loader(text)
             if cookie:
                 return Credentials(cookie_header=cookie, source=str(path))

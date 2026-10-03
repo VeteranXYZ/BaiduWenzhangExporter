@@ -10,12 +10,14 @@ import html as html_module
 import re
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urljoin, urlparse
+from xml.sax.saxutils import escape, quoteattr
 
 from .config import Config
 from .parsers import make_soup
 from .state import ArchiveState
-from .storage import read_json, read_text, write_text_atomic
-from .utils import readable_dirname, sanitize_filename, utcnow_iso
+from .storage import IntegrityError, current_content_path, read_json, read_text, write_text_atomic
+from .utils import sanitize_filename
 
 Logger = Callable[[str, str], None]
 
@@ -70,9 +72,7 @@ def run_export(
         for record in records:
             key = record["key"]
             item_dir = config.item_dir(key)
-            source = item_dir / "content.local.html"
-            if not source.exists():
-                source = item_dir / "content.original.html"
+            source = current_content_path(item_dir)
             if not source.exists():
                 continue
             content_html = read_text(source) or ""
@@ -117,22 +117,48 @@ def export_wxr(config: Config, state: ArchiveState, filename: str = "wordpress_i
         key = record["key"]
         item_dir = config.item_dir(key)
         metadata = read_json(item_dir / "metadata.json", {}) or {}
-        source = item_dir / "content.local.html"
-        if not source.exists():
-            source = item_dir / "content.original.html"
+        source = current_content_path(item_dir, prefer_local=False)
         if not source.exists():
             continue
+        from .truth import article_truth
+        if 'resource_generation_mismatch' in article_truth(config, state, key)['issues']:
+            raise IntegrityError('WXR current resource generation mismatch: ' + key)
         date = metadata.get("content_date") or metadata.get("list_date") or record.get("list_date")
         entries.append(
             {
                 "key": key,
                 "title": metadata.get("title") or record.get("title") or "无标题",
-                "content": read_text(source) or "",
+                "content": wxr_content(read_text(source) or '',
+                    {**metadata, 'detail_url': metadata.get('detail_url') or record.get('detail_url') or config.detail_url(key)},
+                    state.assets_for(key)),
                 "date": date,
                 "url": record.get("detail_url") or "",
                 "tags": metadata.get("tags") or [],
             }
         )
+
+    # Official importer process_post calls post_exists(title, '', date, post_type).
+    # Slug, WXR post_id and _archive_key do NOT bypass that check:
+    # https://github.com/WordPress/wordpress-importer/blob/master/src/class-wp-import.php
+    # Refuse collisions; stable _archive_key metadata remains a traceable identity,
+    # not a promise of importer deduplication behavior.
+    identities = {}
+    for entry in entries:
+        try:
+            date = datetime.strptime(entry['date'] or '1970-01-01', '%Y-%m-%d').strftime('%Y-%m-%d')
+        except ValueError:
+            date = '1970-01-01'
+        entry['date'] = date
+        # Conservative entity/case/accent normalization also catches common SQL
+        # collation equivalences. Actual target filters/collation require live import.
+        import unicodedata
+        title_identity = ''.join(c for c in unicodedata.normalize('NFKD', html_module.unescape(entry['title']).casefold())
+                                 if not unicodedata.combining(c))
+        identity = (title_identity, date + ' 00:00:00', 'post')
+        if identity in identities:
+            raise IntegrityError('WordPress importer identity collision: ' +
+                                 identities[identity] + ' / ' + entry['key'])
+        identities[identity] = entry['key']
 
     def sort_key(entry: dict) -> str:
         return entry["date"] or "0000-00-00"
@@ -149,7 +175,7 @@ def export_wxr(config: Config, state: ArchiveState, filename: str = "wordpress_i
         '    xmlns:wp="http://wordpress.org/export/1.2/">\n'
         "<channel>\n"
         "    <title>百度空间归档</title>\n"
-        f"    <link>{config.site_root}</link>\n"
+        f"    <link>{escape(config.site_root)}</link>\n"
         "    <description>Baidu Space local archive</description>\n"
         f"    <pubDate>{now}</pubDate>\n"
         "    <language>zh-CN</language>\n"
@@ -165,7 +191,7 @@ def export_wxr(config: Config, state: ArchiveState, filename: str = "wordpress_i
         slug_raw = re.sub(r"[^\w\s-]", "", entry["title"]).strip()
         slug = re.sub(r"\s+", "-", slug_raw.lower())[:50] or f"post-{index}"
         tag_xml = "".join(
-            f'\n        <category domain="post_tag" nicename="{sanitize_filename(t, max_length=30)}">'
+            f'\n        <category domain="post_tag" nicename={quoteattr(sanitize_filename(t, max_length=30))}>'
             f"<![CDATA[{_cdata(t)}]]></category>"
             for t in entry["tags"]
         )
@@ -185,153 +211,87 @@ def export_wxr(config: Config, state: ArchiveState, filename: str = "wordpress_i
             "        <wp:postmeta><wp:meta_key><![CDATA[_original_url]]></wp:meta_key>"
             f"<wp:meta_value><![CDATA[{_cdata(entry['url'])}]]></wp:meta_value></wp:postmeta>\n"
             "        <wp:postmeta><wp:meta_key><![CDATA[_archive_key]]></wp:meta_key>"
-            f"<wp:meta_value><![CDATA[{entry['key']}]]></wp:meta_value></wp:postmeta>\n"
+            f"<wp:meta_value><![CDATA[{_cdata(entry['key'])}]]></wp:meta_value></wp:postmeta>\n"
             "    </item>\n"
         )
     parts.append("</channel>\n</rss>\n")
 
+    from xml.etree import ElementTree
+
+    xml = ''.join(parts)
+    try:
+        ElementTree.fromstring(xml)
+    except ElementTree.ParseError:
+        raise IntegrityError('WXR XML 包含无效字符，未发布导出文件') from None
     path = config.root / filename
-    write_text_atomic(path, "".join(parts))
+    write_text_atomic(path, xml)
     return path
+
+
+def wxr_content(content: str, metadata: dict, assets: list[dict]) -> str:
+    """WXR 使用当前未本地化正文，将相对资源引用还原为远程地址。"""
+    from .parsers import parse_srcset
+
+    base = metadata.get('iframe_url_original') or metadata.get('detail_url')
+    mapping = {}
+    for asset in assets:
+        remote = asset.get('resolved_url') or urljoin(base or '', asset['original_url'])
+        if urlparse(remote).scheme not in {'http', 'https'}:
+            continue
+        mapping[asset['original_url']] = remote
+        if asset.get('local_path'):
+            mapping[asset['local_path']] = remote
+
+    def normalize(value):
+        value = html_module.unescape(str(value).strip())
+        if not value or value.startswith('#'):
+            return value
+        if value in mapping:
+            return mapping[value]
+        parsed = urlparse(value)
+        if parsed.scheme:
+            return value  # Preserve mailto/tel/data and intentional special schemes.
+        if value.startswith('assets/') or value.startswith('./assets/') or '/assets/' in value and value.startswith('../'):
+            raise IntegrityError('WXR archive-local URL lacks original remote address: ' + value)
+        remote = urljoin(base or '', value)
+        if value.startswith('//') and not urlparse(remote).scheme:
+            remote = 'https:' + value
+        if urlparse(remote).scheme not in {'http', 'https'} or not urlparse(remote).netloc:
+            raise IntegrityError('WXR relative URL lacks a remote base: ' + value)
+        return remote
+
+    soup = make_soup(content)
+    for node in soup.find_all(True):
+        for attribute in ('src', 'href', 'poster', 'data', 'data-src', 'data-original', 'data-lazy-src'):
+            if node.has_attr(attribute):
+                node[attribute] = normalize(node[attribute])
+        if node.has_attr('srcset'):
+            node['srcset'] = ', '.join(normalize(url) + (' ' + descriptor if descriptor else '')
+                                     for url, descriptor in parse_srcset(str(node['srcset'])))
+        if node.name == 'img':
+            for attribute in ('data-src', 'data-original', 'data-lazy-src'):
+                if node.get(attribute):
+                    node['src'] = node[attribute]
+                    break
+        for attribute in list(node.attrs):
+            if attribute.startswith('data-archive-'):
+                del node[attribute]
+    # Validate final HTML separately from normalization; do not publish unsafe WXR.
+    for node in soup.find_all(True):
+        urls = [str(node[a]) for a in ('src', 'href', 'poster', 'data', 'data-src', 'data-original', 'data-lazy-src') if node.has_attr(a)]
+        urls += [url for url, _ in parse_srcset(str(node.get('srcset') or ''))]
+        for url in urls:
+            if url and not url.startswith('#') and not urlparse(url).scheme:
+                raise IntegrityError('WXR migration-unsafe URL remains: ' + url)
+    return soup.body.decode_contents() if soup.body else str(soup)
 
 
 # --------------------------------------------------------------------------
 # 静态站点（百度关闭后仍可本地阅读）
 # --------------------------------------------------------------------------
 
-_SITE_CSS = """
-:root{--bg:#fff;--fg:#1a1a1a;--muted:#666;--line:#e5e5e5;--accent:#2b6cb0}
-@media(prefers-color-scheme:dark){:root{--bg:#16181c;--fg:#e8e8e8;--muted:#9aa0a6;--line:#2c2f34;--accent:#7cb3ec}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.75 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
-.wrap{max-width:860px;margin:0 auto;padding:32px 16px 80px}
-h1{font-size:1.6rem;margin:0 0 4px}
-.sub{color:var(--muted);font-size:.9rem;margin-bottom:24px}
-input[type=search]{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--fg);font-size:1rem;margin-bottom:20px}
-.year{margin:28px 0 8px;font-size:1.05rem;color:var(--muted);border-bottom:1px solid var(--line);padding-bottom:6px}
-ul{list-style:none;padding:0;margin:0}
-li.post{padding:8px 0;border-bottom:1px solid var(--line)}
-li.post a{color:var(--accent);text-decoration:none}
-li.post a:hover{text-decoration:underline}
-.date{color:var(--muted);font-size:.85rem;margin-right:10px;font-variant-numeric:tabular-nums}
-article img{max-width:100%;height:auto}
-.meta{color:var(--muted);font-size:.85rem;margin-bottom:24px}
-.back{display:inline-block;margin-bottom:20px;color:var(--accent);text-decoration:none}
-.warn{background:#fff4e5;border-left:3px solid #f0a020;padding:8px 12px;margin:16px 0;font-size:.9rem;color:#7a4a00}
-@media(prefers-color-scheme:dark){.warn{background:#2a2113;color:#e0b070}}
-"""
-
-_ARTICLE_TPL = """<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title><link rel="stylesheet" href="../style.css"></head>
-<body><div class="wrap">
-<a class="back" href="../index.html">← 返回目录</a>
-<h1>{title}</h1>
-<div class="meta">{meta}</div>
-{warning}
-<article>{content}</article>
-</div></body></html>
-"""
-
-
 def export_site(config: Config, state: ArchiveState, site_dir: Path) -> int:
-    """生成可离线浏览的静态站点：按年份分组、标题搜索、本地图片。"""
-    site_dir = Path(site_dir)
-    articles_dir = site_dir / "articles"
-    articles_dir.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(site_dir / "style.css", _SITE_CSS)
+    """导出可搜索、筛选、勾选 TXT 导出的独立离线阅读站点。"""
+    from .site import export_reading_site
 
-    records = state.iter_records("page")
-    entries = []
-    for record in records:
-        key = record["key"]
-        item_dir = config.item_dir(key)
-        source = item_dir / "content.local.html"
-        if not source.exists():
-            source = item_dir / "content.original.html"
-        if not source.exists():
-            continue
-        metadata = read_json(item_dir / "metadata.json", {}) or {}
-        title = metadata.get("title") or record.get("title") or "无标题"
-        date = metadata.get("content_date") or metadata.get("list_date") or ""
-        slug = readable_dirname(date, title, key)
-        target_dir = articles_dir / slug
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        content_html = read_text(source) or ""
-        # 站点里的图片指向 items/<key>/assets/，用相对路径穿回去
-        depth_prefix = "../../../"
-        rel_assets = f"{depth_prefix}{config.items_dir.name}/{item_dir.name}/assets/"
-        content_html = content_html.replace('src="assets/', f'src="{rel_assets}')
-        content_html = content_html.replace("src='assets/", f"src='{rel_assets}")
-
-        warnings = metadata.get("warnings") or []
-        warning_html = ""
-        if warnings:
-            warning_html = '<div class="warn">归档提示：' + html_module.escape("；".join(warnings)) + "</div>"
-
-        meta_bits = []
-        if date:
-            meta_bits.append(f"收藏于 {html_module.escape(date)}")
-        if metadata.get("source"):
-            meta_bits.append(html_module.escape(str(metadata["source"])))
-        if metadata.get("tags"):
-            meta_bits.append("标签：" + html_module.escape("、".join(metadata["tags"])))
-        meta_bits.append(f"key {html_module.escape(key)}")
-
-        write_text_atomic(
-            target_dir / "index.html",
-            _ARTICLE_TPL.format(
-                title=html_module.escape(title),
-                meta=" · ".join(meta_bits),
-                warning=warning_html,
-                content=content_html,
-            ),
-        )
-        entries.append({"title": title, "date": date, "href": f"articles/{slug}/index.html"})
-
-    entries.sort(key=lambda e: e["date"] or "0000-00-00", reverse=True)
-    groups: dict[str, list[dict]] = {}
-    for entry in entries:
-        year = (entry["date"] or "")[:4] or "未知年份"
-        groups.setdefault(year, []).append(entry)
-
-    body = []
-    for year in sorted(groups, reverse=True):
-        body.append(f'<div class="year">{html_module.escape(year)}（{len(groups[year])}）</div><ul>')
-        for entry in groups[year]:
-            body.append(
-                f'<li class="post"><span class="date">{html_module.escape(entry["date"] or "—")}</span>'
-                f'<a href="{html_module.escape(entry["href"])}">{html_module.escape(entry["title"])}</a></li>'
-            )
-        body.append("</ul>")
-
-    index_html = f"""<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>百度空间归档</title><link rel="stylesheet" href="style.css"></head>
-<body><div class="wrap">
-<h1>百度空间归档</h1>
-<div class="sub">共 {len(entries)} 篇 · 生成于 {utcnow_iso()}</div>
-<input type="search" id="q" placeholder="搜索标题…" autocomplete="off">
-<div id="list">{''.join(body)}</div>
-<script>
-const q=document.getElementById('q');
-q.addEventListener('input',()=>{{
-  const term=q.value.trim().toLowerCase();
-  document.querySelectorAll('li.post').forEach(li=>{{
-    li.style.display = !term || li.textContent.toLowerCase().includes(term) ? '' : 'none';
-  }});
-  document.querySelectorAll('.year').forEach(h=>{{
-    let n=h.nextElementSibling, any=false;
-    if(n) n.querySelectorAll('li.post').forEach(li=>{{ if(li.style.display!=='none') any=true; }});
-    h.style.display = any ? '' : 'none';
-    if(n) n.style.display = any ? '' : 'none';
-  }});
-}});
-</script>
-</div></body></html>
-"""
-    write_text_atomic(site_dir / "index.html", index_html)
-    return len(entries)
+    return export_reading_site(config, state, site_dir)

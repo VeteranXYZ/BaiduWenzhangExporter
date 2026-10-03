@@ -1,0 +1,485 @@
+"""RC attacks exercise real pipelines and bytes; only HTTP transport is substituted."""
+from __future__ import annotations
+
+import io
+import json
+import wave
+from pathlib import Path
+from urllib.parse import parse_qs
+from xml.etree import ElementTree as ET
+
+import httpx
+import pytest
+
+from baidu_archive import server, cli
+from baidu_archive.assets import run_assets
+from baidu_archive.auth import Credentials, parse_netscape_cookies, load_credentials
+from baidu_archive.client import ArchiveClient
+from baidu_archive.config import Config
+from baidu_archive.export import export_site, export_wxr, wxr_content
+from baidu_archive.integrity import audit_stored_files
+from baidu_archive.media import validate_media_response
+from baidu_archive.parsers import make_soup, parse_srcset
+from baidu_archive.pipeline import run_index, run_parse
+from baidu_archive.state import ArchiveState
+from baidu_archive.storage import IntegrityError, current_content_path, read_json, save_raw
+from baidu_archive.tasks import TaskControl, TaskStopped
+from baidu_archive.truth import article_truth, index_truth, validate_downloaded_asset
+from baidu_archive.verify import run_verify
+
+PNG = (Path(__file__).parent / 'fixtures' / 'tiny.png').read_bytes()
+FIXTURES = Path(__file__).parent / 'fixtures'
+
+
+def list_body(keys, total=None, start=0, limit=30, drift=False):
+    html = ''.join(f'<li class="{"new-unit" if drift and i else "unit"} page" id="key_{k}"><h4><a href="/page/view?key={k}">{k}</a></h4></li>' for i, k in enumerate(keys))
+    return json.dumps({'status': 0, 'data': {'html': html, 'totalCount': len(keys) if total is None else total,
+                                          'currentCount': len(keys), 'start': start, 'limit': limit}}).encode()
+
+
+def transport(cfg, handler, control=None):
+    client = ArchiveClient(cfg, Credentials(), control=control)
+    client._client.close()
+    client._client = httpx.Client(transport=httpx.MockTransport(handler), event_hooks={'request': [client._scope_credentials]})
+    return client
+
+
+def raw_article(cfg, key, body, base='https://media.test/old/body.html', title=None):
+    detail = f'<iframe class="pcs-article-iframe" src="{base}"></iframe>'
+    content = f'<h1 id="detailArticleTitle_x">{title or key}</h1><div id="detailArticleContent_x">{body}</div><div id="detailArticleFooter_x"></div>'
+    for directory, text in ((cfg.detail_dir, detail), (cfg.content_dir, content)):
+        save_raw(directory / (key + '.html'), text.encode(), url=base, status_code=200)
+
+
+@pytest.fixture
+def archive(tmp_path):
+    cfg = Config(root=tmp_path / 'archive', delay=0, jitter=0, max_retries=1, list_url_template='https://wenzhang.baidu.com/fav/list?start={start}&limit={limit}')
+    cfg.ensure_dirs()
+    with ArchiveState(cfg.db_path) as state:
+        with transport(cfg, lambda r: httpx.Response(200, content=list_body(['one']))) as client:
+            assert run_index(cfg, state, client, force=True)['index_complete']
+        raw_article(cfg, 'one', '<p>Body</p><img src="photo.png">')
+        run_parse(cfg, state)
+        yield cfg, state
+
+
+def download(cfg, state, body=PNG, mime='image/png', **kwargs):
+    requests = []
+    with transport(cfg, lambda r: requests.append(str(r.url)) or httpx.Response(200, content=body, headers={'content-type': mime})) as client:
+        stats = run_assets(cfg, state, client, **kwargs)
+    return stats, requests
+
+
+@pytest.mark.parametrize('damage', ['missing', 'changed', 'wrong_digest'])
+@pytest.mark.parametrize('recover', [True, False])
+def test_p1_1_bytes_are_truth_and_recovery_preserves_evidence(archive, damage, recover):
+    cfg, state = archive
+    download(cfg, state)
+    asset = state.assets_for('one')[0]
+    old = cfg.item_dir('one') / asset['local_path']
+    if damage == 'missing': old.unlink()
+    elif damage == 'changed': old.write_bytes(PNG[:-1] + b'X')
+    else: state.record_asset_result('one', 'photo.png', 'src', sha256='0' * 64)
+    assert not validate_downloaded_asset(cfg, state.assets_for('one')[0])['ok']
+    assert not article_truth(cfg, state, 'one')['complete']
+    assert server.Application(cfg).library()['records'][0]['status'] == 'assets_partial'
+    assert not audit_stored_files(cfg, state)['ok']
+    before = old.read_bytes() if old.exists() else None
+    stats, requests = download(cfg, state, body=PNG if recover else b'<html>login</html>', mime='image/png')
+    assert len(requests) == stats['attempted'] == 1
+    assert stats['downloaded'] == int(recover) and stats['failed'] == int(not recover)
+    assert state.get_item('one')['status'] == ('complete' if recover else 'assets_partial')
+    assert article_truth(cfg, state, 'one')['complete'] == recover
+    assert run_verify(cfg, state)['validation']['ok'] == recover
+    assert cli.main(['--root', str(cfg.root), 'verify']) == (0 if recover else 1)
+    node = make_soup((cfg.item_dir('one') / 'content.local.html').read_text()).img
+    if recover:
+        assert validate_downloaded_asset(cfg, state.assets_for('one')[0])['ok']
+        assert (cfg.item_dir('one') / node['src']).is_file()
+    else:
+        assert node['src'] == 'photo.png'
+    if damage == 'changed':
+        assert old.read_bytes() == before  # corrupt bytes remain as evidence
+        assert state.asset_history('one')
+
+
+@pytest.mark.parametrize('recover', [True, False])
+def test_p1_1_server_repair_task_reports_actual_result(archive, monkeypatch, recover):
+    cfg, state = archive
+    download(cfg, state)
+    (cfg.item_dir('one') / state.assets_for('one')[0]['local_path']).unlink()
+    monkeypatch.setattr(server, 'load_credentials', lambda: Credentials(cookie_header='BDUSS=fake'))
+    monkeypatch.setattr(server, 'ArchiveClient', lambda *a, **kw: transport(cfg, lambda r: httpx.Response(200, content=PNG if recover else b'<html>login</html>'), control=kw['control']))
+    app = server.Application(cfg)
+    app.start({'kind': 'assets', 'keys': ['one']})
+    app.thread.join(5)
+    assert not app.thread.is_alive()
+    assert app.snapshot()['status'] == ('completed' if recover else 'partial')
+    assert app.library()['records'][0]['status'] == ('complete' if recover else 'assets_partial')
+
+
+@pytest.mark.parametrize('attack', ['drift', 'increase', 'decrease', 'duplicate', 'interrupted', 'max_pages'])
+def test_p1_2_historical_rows_never_mask_current_generation(archive, attack):
+    cfg, state = archive
+    cfg.page_limit = 1 if attack in {'increase', 'decrease', 'interrupted', 'max_pages'} else 30
+    with transport(cfg, lambda r: httpx.Response(200, content=list_body(['one', 'two']))) as client:
+        cfg.page_limit = 30
+        run_index(cfg, state, client, force=True)
+    previous = state.get_meta('index_last_complete')
+    if attack in {'increase', 'decrease', 'interrupted', 'max_pages'}: cfg.page_limit = 1
+    control = TaskControl()
+    def response(r):
+        start = int(parse_qs(r.url.query.decode())['start'][0])
+        if attack == 'interrupted' and start:
+            control.stop(); control.check()
+        if attack == 'drift': body = list_body(['one', 'three'], drift=True)
+        elif attack == 'duplicate': body = list_body(['one', 'one'])
+        else: body = list_body(['one' if start == 0 else 'three' if start == 1 else 'four'],
+                              total=2 if start == 0 else 3 if attack == 'increase' else 1 if attack == 'decrease' else 2,
+                              start=start, limit=1)
+        return httpx.Response(200, content=body)
+    with transport(cfg, response, control) as client:
+        if attack == 'interrupted':
+            with pytest.raises(TaskStopped): run_index(cfg, state, client, force=True)
+        else:
+            stats = run_index(cfg, state, client, force=True, max_pages=1 if attack == 'max_pages' else None)
+            assert stats['failed'] == 1
+    truth = index_truth(state)
+    assert not truth['ok']
+    assert state.get_record('two')  # historical data preserved
+    assert state.get_meta('index_last_complete') == previous
+    assert not run_verify(cfg, state)['validation']['checks']['index_complete']
+    assert not server.Application(cfg).library()['index_generation']['ok']
+    assert list(cfg.lists_dir.glob('*.json'))
+
+
+def test_p1_2_full_new_generation_keeps_history_without_counting_it(archive):
+    cfg, state = archive
+    state.upsert_record({'key': 'old', 'type': 'page'})
+    with transport(cfg, lambda r: httpx.Response(200, content=list_body(['one', 'three']))) as client:
+        result = run_index(cfg, state, client, force=True)
+    assert result['index_complete'] and result['indexed'] == 2 and result['historical_indexed'] == 3
+    assert index_truth(state)['seen_keys'] == ['one', 'three']
+
+
+def test_p1_3_relative_reference_new_base_gets_new_download(archive):
+    cfg, state = archive
+    download(cfg, state)
+    previous = state.assets_for('one')[0]
+    old = cfg.item_dir('one') / previous['local_path']
+    original = (cfg.item_dir('one') / 'content.original.html').read_bytes()
+    raw_article(cfg, 'one', '<p>Body</p><img src="photo.png">', base='https://media.test/new/body.html')
+    run_parse(cfg, state)
+    assert state.get_item('one')['status'] == 'parsed'
+    current = state.assets_for('one')[0]
+    assert current['resolved_url'] == 'https://media.test/new/photo.png'
+    assert current['download_status'] is None and current['local_path'] is None
+    assert old.read_bytes() == PNG and state.asset_history('one')[0]['record']['download_identity'] == previous['download_identity']
+    assert current_content_path(cfg.item_dir('one')).parent.name == 'parsed'
+    assert not article_truth(cfg, state, 'one')['complete']
+    stats, requests = download(cfg, state, body=PNG + b'new')
+    assert requests == ['https://media.test/new/photo.png'] and stats['downloaded'] == 1
+    assert (cfg.item_dir('one') / 'content.original.html').read_bytes() == original
+    assert run_verify(cfg, state)['validation']['ok']
+
+
+@pytest.mark.parametrize('kind', ['audio', 'video'])
+@pytest.mark.parametrize('response', ['valid', 'html', 'empty', 'captcha', 'wrong_mime', 'unknown'])
+def test_p1_4_media_requires_recognizable_bytes(archive, kind, response):
+    cfg, state = archive
+    raw_article(cfg, 'one', f'<{kind} controls src="clip"></{kind}>')
+    run_parse(cfg, state)
+    body = (FIXTURES / ('tiny.wav' if kind == 'audio' else 'tiny.mp4')).read_bytes()
+    mime = 'audio/wav' if kind == 'audio' else 'video/mp4'
+    if response == 'html': body, mime = b'<html>login</html>', mime
+    elif response == 'empty': body = b''
+    elif response == 'captcha': body, mime = b'<!doctype html><form>captcha</form>', 'application/octet-stream'
+    elif response == 'wrong_mime': mime = 'application/octet-stream'
+    elif response == 'unknown': body = b'unknown format'
+    accepted = response in {'valid', 'wrong_mime'}
+    stats, _ = download(cfg, state, body, mime, include_media=True)
+    assert stats['downloaded'] == int(accepted) and stats['failed'] == int(not accepted)
+    assert state.get_item('one')['status'] == ('complete' if accepted else 'assets_partial')
+    assert article_truth(cfg, state, 'one')['complete'] == accepted
+    assert run_verify(cfg, state)['validation']['ok'] == accepted
+    if not accepted:
+        assert list((cfg.raw_dir / 'asset_responses' / 'one').glob('*.bin'))
+        assert state.assets_for('one')[0]['local_path'] is None
+
+
+@pytest.mark.parametrize('attribute', ['src', 'data-src', 'srcset'])
+def test_p2_5_alias_references_localize_after_one_download(archive, attribute):
+    cfg, state = archive
+    body = '<img srcset="photo.png 1x, ./photo.png 2x">' if attribute == 'srcset' else f'<img {attribute}="photo.png"><img {attribute}="./photo.png">'
+    raw_article(cfg, 'one', body)
+    run_parse(cfg, state)
+    assert len(state.assets_for('one')) == 2
+    stats, requests = download(cfg, state)
+    assert stats['attempted'] == stats['downloaded'] == len(requests) == 1
+    references = state.assets_for('one')
+    assert all(validate_downloaded_asset(cfg, a)['ok'] for a in references)
+    assert len({a['local_path'] for a in references}) == 1
+    soup = make_soup((cfg.item_dir('one') / 'content.local.html').read_text())
+    urls = [u for u, _ in parse_srcset(soup.img['srcset'])] if attribute == 'srcset' else [n['src'] for n in soup.find_all('img')]
+    assert len(urls) == 2 and len(set(urls)) == 1
+    assert (cfg.item_dir('one') / urls[0]).is_file()
+
+
+def test_p2_6_offline_csp_allows_actual_local_wav_and_mp4(archive):
+    cfg, state = archive
+    raw_article(cfg, 'one', '<audio controls src="clip.wav"></audio><video controls src="clip.mp4"></video>')
+    run_parse(cfg, state)
+    with transport(cfg, lambda r: httpx.Response(200, content=(FIXTURES / ('tiny.wav' if r.url.path.endswith('.wav') else 'tiny.mp4')).read_bytes())) as client:
+        run_assets(cfg, state, client, include_media=True)
+    site = cfg.root.parent / 'site'
+    export_site(cfg, state, site)
+    soup = make_soup((site / 'articles' / 'one' / 'index.html').read_text())
+    directives = dict((parts[0], parts[1:]) for d in soup.find('meta', attrs={'http-equiv': 'Content-Security-Policy'})['content'].split(';') if (parts := d.split()))
+    assert directives['default-src'] == ["'none'"] and directives['media-src'] == ["'self'"]
+    for node in soup.find_all(['audio', 'video']):
+        path = site / 'articles' / 'one' / node['src']
+        assert path.is_file()
+        assert validate_media_response(node.name, path.read_bytes(), None)['status'] == 'accepted'
+
+
+def test_p2_7_wxr_normalizes_all_url_attributes_and_preserves_special_schemes():
+    body = '<img src="photo.png" data-src="./lazy.png" srcset="./one.png 1x, //cdn.test/two.png 2x"><picture><source srcset="../wide.png 400w"></picture><video src="clip.mp4" poster="poster.png"><source src="./alt.mp4"></video><audio src="sound.wav"></audio><iframe src="assets/player.html"></iframe><a href="../relative?a=1&amp;b=2">relative</a>'
+    special = ['#anchor', 'mailto:a@b.test', 'tel:123', 'data:text/plain,hello', 'magnet:?xt=urn:btih:123']
+    body += ''.join(f'<a href="{url}">x</a>' for url in special)
+    out = wxr_content(body, {'iframe_url_original': 'https://remote.test/old/body.html'}, [{'original_url': 'player.html', 'resolved_url': 'https://player.test/watch', 'local_path': 'assets/player.html'}])
+    soup = make_soup(out)
+    assert soup.iframe['src'] == 'https://player.test/watch'
+    assert soup.img['src'] == 'https://remote.test/old/lazy.png'
+    assert soup.video['src'] == 'https://remote.test/old/clip.mp4'
+    assert soup.audio['src'] == 'https://remote.test/old/sound.wav'
+    assert soup.a['href'] == 'https://remote.test/relative?a=1&b=2'
+    assert [a['href'] for a in soup.find_all('a')][1:] == special
+    assert 'assets/player.html' not in out
+    assert parse_srcset(soup.img['srcset'])[-1][0] == 'https://cdn.test/two.png'
+    with pytest.raises(IntegrityError): wxr_content('<iframe src="assets/unknown.html"></iframe>', {}, [])
+    with pytest.raises(IntegrityError): wxr_content('<a href="../unknown"></a>', {}, [])
+
+
+def test_p2_8_official_importer_collision_is_blocked_before_publish(archive):
+    cfg, state = archive
+    with transport(cfg, lambda r: httpx.Response(200, content=list_body(['one', 'two']))) as client:
+        run_index(cfg, state, client, force=True)
+    for key in ['one', 'two']:
+        raw_article(cfg, key, f'<p>{key}</p>', title='same &amp; title')
+    run_parse(cfg, state)
+    target = cfg.root / 'wordpress_import.xml'
+    target.write_bytes(b'previous export evidence')
+    with pytest.raises(IntegrityError, match='identity collision.*one.*two'):
+        export_wxr(cfg, state)
+    assert target.read_bytes() == b'previous export evidence'
+    metadata = read_json(cfg.item_dir('two') / 'metadata.json')
+    metadata['title'] = 'different title'
+    (cfg.item_dir('two') / 'metadata.json').write_text(json.dumps(metadata))
+    tree = ET.parse(export_wxr(cfg, state))
+    ns = {'wp': 'http://wordpress.org/export/1.2/'}
+    identities = [item.find("wp:postmeta[wp:meta_key='_archive_key']/wp:meta_value", ns).text for item in tree.findall('channel/item')]
+    assert identities == ['one', 'two']
+
+
+def test_p2_9_cancel_between_articles_preserves_atomic_first_save(archive, monkeypatch):
+    cfg, state = archive
+    with transport(cfg, lambda r: httpx.Response(200, content=list_body(['one', 'two', 'three']))) as client:
+        run_index(cfg, state, client, force=True)
+    for key in ['one', 'two', 'three']: raw_article(cfg, key, '<p>new body</p>')
+    from baidu_archive import pipeline
+    control = TaskControl()
+    real_parse = pipeline.parse_content_html
+    calls = []
+    def stop_during_first(body):
+        calls.append(body)
+        control.stop()
+        return real_parse(body)
+    monkeypatch.setattr(pipeline, 'parse_content_html', stop_during_first)
+    with pytest.raises(TaskStopped): run_parse(cfg, state, control=control)
+    assert len(calls) == 1
+    assert (cfg.item_dir('one') / 'metadata.json').is_file()
+    assert not (cfg.item_dir('two') / 'metadata.json').exists()
+    assert not (cfg.item_dir('three') / 'metadata.json').exists()
+    monkeypatch.setattr(server, 'load_credentials', lambda: Credentials(cookie_header='BDUSS=fake'))
+    app = server.Application(cfg)
+    monkeypatch.setattr(server, 'run_fetch', lambda *a, **k: {'failed': 0})
+    def stop_server_first(body):
+        app.stop()
+        return real_parse(body)
+    monkeypatch.setattr(pipeline, 'parse_content_html', stop_server_first)
+    # Force a new raw body so the first article is not skipped.
+    raw_article(cfg, 'one', '<p>another body</p>')
+    app.start({'kind': 'archive', 'keys': ['one', 'two', 'three'], 'images': False})
+    app.thread.join(5)
+    assert not app.thread.is_alive() and app.snapshot()['status'] == 'stopped'
+    assert not (cfg.item_dir('two') / 'metadata.json').exists()
+
+
+def test_p2_10_netscape_jar_retains_semantics_and_client_filters_requests(tmp_path, monkeypatch):
+    import time
+    future = int(time.time()) + 86400
+    lines = [f'#HttpOnly_.baidu.com\tTRUE\t/\tTRUE\t{future}\tBDUSS\tfake',
+             f'foreign.test\tFALSE\t/\tFALSE\t{future}\tFOREIGN\tbad',
+             '.baidu.com\tTRUE\t/\tFALSE\t1\tEXPIRED\tbad',
+             f'wenzhang.baidu.com\tFALSE\t/fav\tFALSE\t{future}\tPATH\tgood',
+             f'wenzhang.baidu.com\tFALSE\t/\tFALSE\t{future}\tHOST\tgood',
+             f'#ordinary comment\tTRUE\t/\tFALSE\t{future}\tCOMMENT\tbad',
+             '', 'malformed', '.baidu.com\tBAD\t/\tFALSE\t0\tBAD\tbad',
+             '.baidu.com\tTRUE\t/\tFALSE\t0\tUNICODE\t中文']
+    text = '\n'.join(lines)
+    jar = parse_netscape_cookies(text)
+    credentials = Credentials(cookie_jar=jar)
+    bduss = next(c for c in jar if c.name == 'BDUSS')
+    assert bduss.domain == '.baidu.com' and bduss.domain_specified and bduss.secure
+    assert bduss.path == '/' and bduss.expires == future and bduss.has_nonstandard_attr('HttpOnly')
+    assert credentials.header_for('https://wenzhang.baidu.com/fav/list') == 'PATH=good; BDUSS=fake; HOST=good'
+    assert credentials.header_for('https://wenzhang.baidu.com/other') == 'BDUSS=fake; HOST=good'
+    assert 'BDUSS' not in credentials.header_for('http://wenzhang.baidu.com/fav/list')
+    assert 'HOST' not in credentials.header_for('https://sub.wenzhang.baidu.com/')
+    assert 'BDUSS' not in credentials.header_for('https://foreign.test/')
+    monkeypatch.chdir(tmp_path)
+    secret = tmp_path / 'secrets'; secret.mkdir(); (secret / 'cookies.netscape.txt').write_text(text)
+    monkeypatch.delenv('BAIDU_ARCHIVE_COOKIE', raising=False)
+    assert load_credentials().cookie_jar is not None
+    cfg = Config(root=tmp_path / 'archive', delay=0, jitter=0)
+    captured = []
+    with ArchiveClient(cfg, credentials) as client:
+        client._client.close()
+        client._client = httpx.Client(transport=httpx.MockTransport(lambda r: captured.append(dict(r.headers)) or httpx.Response(200)), event_hooks={'request': [client._scope_credentials]})
+        for url in ['https://wenzhang.baidu.com/fav/list', 'https://wenzhang.baidu.com/other', 'http://wenzhang.baidu.com/fav/list', 'https://foreign.test/']:
+            client._client.get(url)
+    assert captured[0]['cookie'] == 'PATH=good; BDUSS=fake; HOST=good'
+    assert captured[1]['cookie'] == 'BDUSS=fake; HOST=good'
+    assert 'cookie' not in captured[2] and 'cookie' not in captured[3]
+
+
+@pytest.mark.parametrize('damage', ['absolute', 'escape', 'outside_assets', 'directory', 'symlink', 'wrong_size', 'wrong_identity'])
+def test_shared_resource_validator_refuses_unsafe_or_inconsistent_records(archive, damage):
+    cfg, state = archive
+    download(cfg, state)
+    asset = state.assets_for('one')[0]
+    if damage == 'absolute': asset['local_path'] = str(cfg.item_dir('one') / asset['local_path'])
+    elif damage == 'escape': asset['local_path'] = '../outside.png'
+    elif damage == 'outside_assets': asset['local_path'] = 'content.original.html'
+    elif damage == 'directory':
+        path = cfg.item_dir('one') / 'assets' / 'dir'; path.mkdir(); asset['local_path'] = 'assets/dir'
+    elif damage == 'symlink':
+        link = cfg.item_dir('one') / 'assets' / 'link.png'; link.symlink_to(cfg.item_dir('one') / asset['local_path']); asset['local_path'] = 'assets/link.png'
+    elif damage == 'wrong_size': asset['size'] += 1
+    elif damage == 'wrong_identity': asset['resolved_url'] = 'https://other.test/photo.png'
+    assert not validate_downloaded_asset(cfg, asset)['ok']
+
+
+def test_gui_data_api_uses_shared_truth_without_a_native_window(archive, monkeypatch):
+    # Stub only the optional UI import surface; get_stats itself executes unchanged.
+    import importlib, sys, types
+    view = types.ModuleType('webview'); menu = types.ModuleType('webview.menu')
+    menu.Menu = menu.MenuAction = menu.MenuSeparator = object
+    monkeypatch.setitem(sys.modules, 'webview', view)
+    monkeypatch.setitem(sys.modules, 'webview.menu', menu)
+    gui = importlib.import_module('baidu_archive.gui')
+    cfg, state = archive
+    download(cfg, state)
+    api = gui.Api(cfg)
+    assert api.get_stats()['complete'] == 1
+    (cfg.item_dir('one') / state.assets_for('one')[0]['local_path']).unlink()
+    stats = api.get_stats()
+    assert stats['complete'] == 0 and stats['assets_downloaded'] == 0 and stats['assets_failed'] == 1
+    generation = state.get_meta('index_generation'); generation['complete'] = False
+    state.set_meta('index_generation', generation)
+    assert not api.get_stats()['index_complete']
+    sys.modules.pop('baidu_archive.gui', None)
+
+
+def test_corrupt_media_is_not_served_even_with_database_success(archive):
+    import threading
+    cfg, state = archive
+    download(cfg, state)
+    asset = state.assets_for('one')[0]
+    (cfg.item_dir('one') / asset['local_path']).write_bytes(PNG[:-1] + b'X')
+    app = server.Application(cfg)
+    service = server.LocalServer(('127.0.0.1', 0), app)
+    thread = threading.Thread(target=service.serve_forever); thread.start()
+    try:
+        response = httpx.get(f'http://127.0.0.1:{service.server_port}/media/one/' + Path(asset['local_path']).name, trust_env=False)
+        assert response.status_code == 404
+    finally:
+        service.shutdown(); service.server_close(); thread.join(5)
+
+
+def test_reading_views_do_not_reuse_stale_local_references(archive):
+    cfg, state = archive
+    download(cfg, state)
+    asset = state.assets_for('one')[0]
+    saved_local = (cfg.item_dir('one') / 'content.local.html').read_bytes()
+    (cfg.item_dir('one') / asset['local_path']).unlink()
+    site = cfg.root.parent / 'reading'
+    export_site(cfg, state, site)
+    node = make_soup((site / 'articles' / 'one' / 'index.html').read_text()).img
+    assert not node['src'].startswith('assets/')
+    node = make_soup(server.Application(cfg).article('one').decode()).img
+    assert not node.has_attr('src')
+    assert (cfg.item_dir('one') / 'content.local.html').read_bytes() == saved_local
+
+
+def test_missing_parsed_version_is_rebuilt_from_verified_raw(archive):
+    cfg, state = archive
+    download(cfg, state)
+    parsed = current_content_path(cfg.item_dir('one'), prefer_local=False)
+    expected = parsed.read_bytes(); parsed.unlink()
+    assert not article_truth(cfg, state, 'one')['complete']
+    result = run_parse(cfg, state)
+    assert result['parsed'] == 1 and result['skip'] == 0
+    assert parsed.read_bytes() == expected
+    assert article_truth(cfg, state, 'one')['complete']
+
+
+def test_current_resource_set_mismatch_blocks_localization_publication(archive):
+    cfg, state = archive
+    download(cfg, state)
+    before = (cfg.item_dir('one') / 'content.local.html').read_bytes()
+    state.upsert_asset('one', {'kind': 'image', 'original_url': 'photo.png', 'attribute': 'src',
+                              'resolved_url': 'https://wrong.test/photo.png', 'downloadable': True})
+    with transport(cfg, lambda r: (_ for _ in ()).throw(AssertionError('must not download stale collection'))) as client:
+        with pytest.raises(IntegrityError, match='资源集合'):
+            run_assets(cfg, state, client)
+    assert (cfg.item_dir('one') / 'content.local.html').read_bytes() == before
+    assert state.get_item('one')['status'] == 'parsed'
+    assert not audit_stored_files(cfg, state)['ok']
+
+
+def test_incomplete_generation_is_partial_in_cli_run_history(archive):
+    cfg, state = archive
+    generation = state.get_meta('index_generation'); generation['complete'] = False
+    state.set_meta('index_generation', generation)
+    with state.tracked_run('assets') as stats:
+        stats.update(download(cfg, state)[0])
+    assert stats['failed'] == 0 and stats['incomplete_items'] == 1
+    assert state.recent_runs(1)[0]['stats']['outcome'] == 'partial'
+    assert state.get_item('one')['status'] == 'parsed'
+
+
+def test_new_raw_generation_cannot_inherit_old_article_completeness(archive):
+    cfg, state = archive
+    download(cfg, state)
+    assert article_truth(cfg, state, 'one')['complete']
+    raw_article(cfg, 'one', '<p>changed body</p><img src="photo.png">')
+    facts = article_truth(cfg, state, 'one')
+    assert not facts['complete'] and 'stale_content_generation' in facts['issues']
+    assert server.Application(cfg).library()['records'][0]['status'] == 'assets_partial'
+    assert not run_verify(cfg, state)['validation']['ok']
+    run_parse(cfg, state)
+    download(cfg, state)
+    assert article_truth(cfg, state, 'one')['complete']
+
+
+def test_assets_refuses_unparsed_raw_generation_without_republishing(archive):
+    cfg, state = archive
+    download(cfg, state)
+    before = (cfg.item_dir('one') / 'content.local.html').read_bytes()
+    raw_article(cfg, 'one', '<p>new raw body</p>')
+    with transport(cfg, lambda r: (_ for _ in ()).throw(AssertionError('stale parse must not fetch assets'))) as client:
+        with pytest.raises(IntegrityError, match='raw 世代'):
+            run_assets(cfg, state, client)
+    assert (cfg.item_dir('one') / 'content.local.html').read_bytes() == before
+    assert state.get_item('one')['status'] == 'parsed'

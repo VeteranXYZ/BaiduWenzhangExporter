@@ -8,6 +8,7 @@ from baidu_archive.auth import (
     build_list_url_template,
     load_credentials,
     parse_curl,
+    import_curl,
 )
 
 FAKE_CURL = """curl 'https://wenzhang.baidu.com/api/getlist?start=30&limit=30&tag=' \\
@@ -107,3 +108,24 @@ def test_build_list_url_template_only_digit_cachebusters():
     template = build_list_url_template("https://x.com/a?t=abc&start=0&limit=30")
     assert "t=abc" in template
     assert "{ts}" not in template
+
+
+def test_import_curl_atomically_restricts_existing_session(tmp_path):
+    path = tmp_path / "session.json"
+    path.write_text("previous session")
+    path.chmod(0o644)
+    import_curl(FAKE_CURL, secrets_dir=tmp_path)
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert load_credentials(secrets_dir=tmp_path).cookie_header == "BDUSS=FAKEBDUSS; STOKEN=FAKESTOKEN"
+
+
+def test_netscape_httponly_bduss_fixture_loads_login_credentials(tmp_path, monkeypatch):
+    from pathlib import Path
+    monkeypatch.delenv('BAIDU_ARCHIVE_COOKIE', raising=False)
+    fixture = Path(__file__).parent / 'fixtures' / 'netscape_httponly.txt'
+    text = fixture.read_text()
+    assert _cookies_from_netscape(text) == 'BDUSS=FAKE_HTTPONLY_BDUSS; STOKEN=FAKE_STOKEN'
+    (tmp_path / 'cookies.netscape.txt').write_text(text)
+    credentials = load_credentials(secrets_dir=tmp_path)
+    assert credentials.looks_logged_in()
+    assert credentials.cookie_names() == ['BDUSS', 'STOKEN']

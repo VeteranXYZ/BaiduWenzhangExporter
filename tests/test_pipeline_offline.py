@@ -15,6 +15,8 @@ from baidu_archive.pipeline import export_master_index, run_parse
 from baidu_archive.state import ArchiveState
 from baidu_archive.verify import run_verify
 
+from conftest import seed_generation
+
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
@@ -35,6 +37,7 @@ def seeded(tmp_path):
         else:
             state.update_item(record["key"], status="skipped_non_page")
 
+    seed_generation(state, [r['key'] for r in records], parsed['total_count'])
     # 只给第一条 page 造 raw 数据，第二条 page 故意留空（模拟未抓取）
     key = records[0]["key"]
     (config.detail_dir / f"{key}.html").write_text(
@@ -116,6 +119,29 @@ def test_parse_force_rebuilds(seeded):
     assert again["parsed"] == 1
 
 
+@pytest.mark.parametrize("body, status", [((Path(__file__).parent / 'fixtures' / 'tiny.png').read_bytes(), "complete"),
+                                         (b"<html>gone</html>", "assets_partial")])
+def test_resource_result_matches_metadata_and_database(seeded, body, status):
+    import httpx
+    from baidu_archive.assets import run_assets
+    from baidu_archive.auth import Credentials
+    from baidu_archive.client import ArchiveClient
+
+    config, state, key = seeded
+    config.delay = config.jitter = 0
+    seed_generation(state, [r["key"] for r in state.iter_records()])
+    run_parse(config, state)
+    with ArchiveClient(config, Credentials()) as client:
+        client._client.close()
+        client._client = httpx.Client(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=body)))
+        stats = run_assets(config, state, client, only_keys=[key])
+    metadata = json.loads((config.item_dir(key) / "metadata.json").read_text())
+    assert metadata["status"] == state.get_item(key)["status"] == status
+    assert stats["attempted"] > 0
+    assert bool(stats["failed"]) == (status == "assets_partial")
+
+
 def test_export_md_txt(seeded):
     config, state, key = seeded
     run_parse(config, state)
@@ -146,13 +172,62 @@ def test_export_site_is_browsable_offline(seeded):
     count = export_site(config, state, site)
     assert count == 1
     index = (site / "index.html").read_text(encoding="utf-8")
-    assert "示例文章标题" in index
-    assert "2011" in index                       # 按年份分组
+    assert 'src="archive-data.js"' in index
+    data = (site / "archive-data.js").read_text(encoding="utf-8")
+    assert "示例文章标题" in data
+    assert "2011" in data                       # 按年份筛选
+    assert '"other": 1' in data                 # 其他收藏不消失
+    assert '"pending": 1' in data
     assert (site / "style.css").exists()
     articles = list((site / "articles").iterdir())
     assert len(articles) == 1
     page = (articles[0] / "index.html").read_text(encoding="utf-8")
     assert "示例文章标题" in page and "返回目录" in page
+    assert 'href="../../index.html"' in page
+    assert 'href="../../style.css"' in page
+
+
+def test_export_site_copies_assets_for_portability(seeded):
+    config, state, key = seeded
+    run_parse(config, state)
+    import httpx
+    from baidu_archive.assets import run_assets
+    from baidu_archive.auth import Credentials
+    from baidu_archive.client import ArchiveClient
+    body = (FIXTURES / 'tiny.png').read_bytes()
+    config.delay = config.jitter = 0
+    with ArchiveClient(config, Credentials()) as client:
+        client._client.close()
+        client._client = httpx.Client(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=body, headers={'content-type': 'image/png'})))
+        run_assets(config, state, client, only_keys=[key])
+    downloaded = [a for a in state.assets_for(key) if a['download_status'] == 'ok']
+    assert len(downloaded) == 3
+    site = config.root.parent / "elsewhere" / "reading"
+    export_site(config, state, site)
+    article_dir = next((site / "articles").iterdir())
+    for asset in downloaded:
+        assert (article_dir / asset['local_path']).read_bytes() == body
+        assert ('src="' + asset['local_path'] + '"') in (article_dir / 'index.html').read_text()
+
+
+def test_export_site_inert_reading_copy_preserves_original(seeded):
+    config, state, key = seeded
+    run_parse(config, state)
+    source = config.item_dir(key) / "content.original.html"
+    raw = '<p onclick="alert(1)">历史正文</p><script>alert(1)</script><iframe src="https://example.com"></iframe>'
+    source.write_text(raw)
+    # 模拟升级前归档（没有 parsed 版本字段），仍支持原始正文作为阅读源。
+    metadata_path = config.item_dir(key) / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.pop("parsed_sha256")
+    metadata_path.write_text(json.dumps(metadata))
+    site = config.root.parent / "site"
+    export_site(config, state, site)
+    article = next((site / "articles").glob("*/index.html")).read_text()
+    assert "历史正文" in article
+    assert "alert(1)" not in article and "<iframe" not in article
+    assert source.read_text() == raw
 
 
 def test_master_index_preserves_original_order(seeded):
@@ -215,6 +290,24 @@ def test_verify_status_counts_are_mutually_exclusive(seeded):
     assert pages["parsed"] <= pages["total"]
 
 
+def test_verify_rejects_duplicate_positions_even_without_gap(seeded):
+    config, state, key = seeded
+    records = state.iter_records()
+    state.upsert_record({**records[1], "global_position": 0})
+    assert run_verify(config, state)["original_order"]["contiguous"] is False
+
+
+def test_verify_completed_items_keep_cumulative_progress(seeded):
+    config, state, key = seeded
+    run_parse(config, state)
+    state.advance_status(key, "complete")
+    summary = run_verify(config, state)
+    assert summary["baidu_space_pages"]["parsed"] == 0
+    assert summary["baidu_space_pages"]["stages"]["parsed"] == 1
+    report = (config.reports_dir / "summary.md").read_text()
+    assert "| 已解析 | 1 |" in report
+
+
 def test_metadata_keeps_both_tag_sources_and_note(seeded):
     """列表标签与正文标签各存一份，备注也要保留。"""
     config, state, key = seeded
@@ -232,3 +325,74 @@ def test_metadata_keeps_both_sources(seeded):
     metadata = json.loads((config.item_dir(key) / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["list_source"] == "来自于百度空间"
     assert metadata["content_source"] == "来自于百度空间"
+
+
+def test_wxr_uses_remote_images_even_after_localization(seeded):
+    from baidu_archive.assets import localize_html
+    from baidu_archive.storage import current_content_path, write_json_atomic
+    import xml.etree.ElementTree as ET
+    config, state, key = seeded
+    run_parse(config, state)
+    folder = config.item_dir(key)
+    original = current_content_path(folder, prefer_local=False).read_text()
+    image = next(a for a in state.assets_for(key) if a['kind']=='image' and a['downloadable'])
+    local = localize_html(original, {image['original_url']: 'assets/local.jpg'})
+    (folder/'content.local.html').write_text(local)
+    metadata = json.loads((folder/'metadata.json').read_text())
+    metadata['localized_from_sha256'] = metadata['parsed_sha256']
+    metadata['localized_resource_fingerprint'] = metadata['resource_fingerprint']
+    write_json_atomic(folder/'metadata.json', metadata)
+    assert 'assets/local.jpg' in current_content_path(folder).read_text()
+    document = ET.parse(export_wxr(config, state))
+    content = document.find('.//{http://purl.org/rss/1.0/modules/content/}encoded').text
+    assert image['resolved_url'] in content
+    assert 'src="assets/' not in content and 'srcset="assets/' not in content
+
+
+@pytest.mark.parametrize('special', ['A&B','<tag>','"quoted"',"'apostrophe'",'A&B <C> "D" \'E\' ]]>'])
+def test_wxr_xml_special_characters_round_trip(seeded, special):
+    import xml.etree.ElementTree as ET
+    from baidu_archive.storage import write_json_atomic
+    config,state,key = seeded
+    run_parse(config,state)
+    folder = config.item_dir(key)
+    metadata = json.loads((folder/'metadata.json').read_text())
+    metadata.update(title=special, tags=[special])
+    write_json_atomic(folder/'metadata.json',metadata)
+    config.site_root = 'https://example.test/?a=1&b=<2>"\''
+    document=ET.parse(export_wxr(config,state))
+    assert document.find('channel/link').text == config.site_root
+    assert document.find('.//item/title').text == special
+    category=document.find('.//category[@domain="post_tag"]')
+    assert category.text == special
+    from baidu_archive.utils import sanitize_filename
+    assert category.attrib['nicename'] == sanitize_filename(special,max_length=30)
+
+
+def test_wxr_legacy_local_path_restored_and_unmapped_path_rejected():
+    from baidu_archive.export import wxr_content
+    from baidu_archive.storage import IntegrityError
+    content='<img src="assets/local.png">'
+    restored=wxr_content(content,{},[{'original_url':'https://x/original.png','local_path':'assets/local.png'}])
+    assert 'src="https://x/original.png"' in restored and 'src="assets/' not in restored
+    with pytest.raises(IntegrityError):
+        wxr_content(content,{},[])
+
+
+def test_wxr_relative_images_resolve_against_current_original_page():
+    from baidu_archive.export import wxr_content
+    restored=wxr_content('<img src="images/photo.png">',{'iframe_url_original':'https://x/articles/body.html'},[])
+    assert 'src="https://x/articles/images/photo.png"' in restored
+
+
+def test_wxr_invalid_xml_character_does_not_publish(seeded):
+    from baidu_archive.storage import IntegrityError, write_json_atomic
+    config,state,key=seeded
+    run_parse(config,state)
+    path=config.item_dir(key)/'metadata.json'
+    metadata=json.loads(path.read_text())
+    metadata['title']='invalid\x00title'
+    write_json_atomic(path,metadata)
+    with pytest.raises(IntegrityError):
+        export_wxr(config,state)
+    assert not (config.root/'wordpress_import.xml').exists()

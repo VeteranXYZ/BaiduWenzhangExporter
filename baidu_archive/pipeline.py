@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import csv
 import math
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import closing
 from typing import Any, Callable
 
 from .client import ArchiveClient, AuthExpired, FetchError
@@ -22,8 +22,9 @@ from .parsers import (
     parse_list_json,
 )
 from .state import ArchiveState
-from .storage import read_text, save_raw, write_json_atomic, write_text_atomic
-from .utils import redact_url, sha256_bytes, truncate, utcnow_iso
+from .tasks import TaskControl, TaskStopped, bounded_results
+from .storage import IntegrityError, current_content_path, read_json, read_raw, save_raw, write_json_atomic, write_once, write_text_atomic
+from .utils import redact_url, safe_key_dirname, sha256_bytes, sha256_file, truncate, utcnow_iso
 
 Logger = Callable[[str, str], None]
 
@@ -45,93 +46,113 @@ def run_index(
     force: bool = False,
     max_pages: int | None = None,
 ) -> dict[str, Any]:
-    """翻完所有分页，落 raw JSON，建立全部 504 条 master index。"""
+    """Record current observations separately from the preserved historical index."""
+    from uuid import uuid4
     config.ensure_dirs()
+    control = getattr(client, 'control', None) or TaskControl()
+    run_id = uuid4().hex
+    generation = {'run_id': run_id, 'status': 'running', 'complete': False,
+                  'seen_keys': [], 'pages': [], 'parsed_count': 0, 'declared_total': None,
+                  'declared_totals': [], 'errors': [], 'pagination_complete': False}
+
+    def persist():
+        state.set_meta('index_generation', generation)
+        state.set_meta('index_run:' + run_id, generation)
+
+    persist()  # An interrupted new attempt cannot inherit an old complete result.
+    start, pages_done = 0, 0
+    seen, duplicates = set(), []
+    missing = 0
     limit = config.page_limit
-    start = 0
-    total_count: int | None = None
-    pages_done = 0
-    seen_keys: set[str] = set()
-    duplicates: list[str] = []
-    missing_key_rows = 0
-
-    while True:
-        url = config.list_url(start, limit)
-        raw_path = config.lists_dir / f"list_start{start:05d}.json"
-
-        if raw_path.exists() and not force:
-            body = raw_path.read_bytes()
-            log("INDEX", f"start={start} 复用已有 raw（--force 可强制重取）")
-        else:
-            response = client.get(url, expect="json")
-            body = response.content
-            save_raw(
-                raw_path,
-                body,
-                url=url,
-                status_code=response.status_code,
-                headers=response.headers,
-                extra={"stage": "list", "start": start, "limit": limit},
-            )
-
-        try:
-            parsed = parse_list_json(body)
-        except ListResponseError as exc:
-            state.record_failure(None, "index", url_redacted=redact_url(url), error=str(exc))
-            raise
-
-        if total_count is None:
-            total_count = parsed["total_count"]
-            state.set_meta("total_count", total_count)
-            state.set_meta("page_limit", parsed["limit"] or limit)
-            expected_pages = math.ceil(total_count / (parsed["limit"] or limit)) if total_count else 0
-            log("INDEX", f"API totalCount = {total_count}，预计 {expected_pages} 页")
-
-        records = parse_list_html(parsed["html"], offset=parsed["start"] or start, site_root=config.site_root)
-        pages_done += 1
-        page_no = pages_done
-        total_pages = math.ceil((total_count or 0) / limit) if total_count else "?"
-        log("INDEX", f"page {page_no}/{total_pages} — 解析出 {len(records)} 条")
-
-        for record in records:
-            if not record.get("key"):
-                missing_key_rows += 1
-                state.record_failure(None, "index", error="列表项缺少 key", url_redacted=redact_url(url))
-                continue
-            if record["key"] in seen_keys:
-                duplicates.append(record["key"])
-            seen_keys.add(record["key"])
-            state.upsert_record(record)
-            if record["type"] == "page":
-                state.ensure_item(record["key"], "pending")
+    try:
+        while True:
+            control.check()
+            url = config.list_url(start, limit)
+            raw_path = config.lists_dir / f'list_start{start:05d}.json'
+            if raw_path.exists() and not force:
+                body = read_raw(raw_path).content
             else:
-                state.ensure_item(record["key"], "skipped_non_page")
-                state.update_item(record["key"], status="skipped_non_page")
-
-        current = parsed["current_count"] or len(records)
-        start += parsed["limit"] or limit
-        if max_pages and pages_done >= max_pages:
-            log("INDEX", f"已达 --max-pages {max_pages}，提前结束")
-            break
-        if total_count and start >= total_count:
-            break
-        if current == 0:
-            log("INDEX", "本页返回 0 条，提前结束")
-            break
-
-    stats = {
-        "total_count_api": total_count,
-        "pages_fetched": pages_done,
-        "unique_keys": len(seen_keys),
-        "duplicate_keys": sorted(set(duplicates)),
-        "rows_missing_key": missing_key_rows,
-        "indexed": state.count_records(),
-        "types": state.type_counts(),
-    }
-    state.set_meta("index_stats", stats)
-    state.set_meta("indexed_at", utcnow_iso())
+                response = client.get(url, expect='json')
+                body = response.content
+                save_raw(raw_path, body, url=url, status_code=response.status_code,
+                         headers=response.headers, extra={'stage': 'list', 'start': start,
+                                                          'limit': limit, 'index_run_id': run_id})
+            parsed = parse_list_json(body)
+            declared = parsed['total_count']
+            generation['declared_totals'].append(declared)
+            if generation['declared_total'] is None:
+                generation['declared_total'] = declared
+                state.set_meta('total_count', declared)
+            elif declared != generation['declared_total']:
+                generation['errors'].append('total_count_changed')
+            page_limit = parsed['limit']
+            records = parse_list_html(parsed['html'], offset=start, site_root=config.site_root)
+            page_errors = []
+            if parsed['start'] != start:
+                page_errors.append('unexpected_start')
+            if not isinstance(page_limit, int) or page_limit <= 0 or page_limit != limit:
+                page_errors.append('unexpected_limit')
+            if (isinstance(declared, int) and isinstance(page_limit, int) and
+                    parsed['current_count'] != min(page_limit, max(0, declared - start))):
+                page_errors.append('unexpected_page_count')
+            if parsed['current_count'] != len(records):
+                page_errors.append('parsed_count_mismatch')
+            for record in records:
+                if not record.get('key'):
+                    missing += 1
+                    page_errors.append('missing_key')
+                    continue
+                key = record['key']
+                if key in seen:
+                    duplicates.append(key)
+                    page_errors.append('duplicate_key')
+                seen.add(key)
+                state.upsert_record(record)
+                state.ensure_item(key, 'pending' if record['type'] == 'page' else 'skipped_non_page')
+                if record['type'] != 'page':
+                    state.update_item(key, status='skipped_non_page')
+            pages_done += 1
+            generation['seen_keys'] = sorted(seen)
+            generation['parsed_count'] += len(records)
+            generation['pages'].append({'start': start, 'limit': page_limit,
+                'declared_total': declared, 'declared_count': parsed['current_count'],
+                'parsed_count': len(records), 'errors': page_errors})
+            generation['errors'].extend(page_errors)
+            persist()
+            log('INDEX', f'page {pages_done} — observed {len(seen)} / declared {declared}')
+            step = page_limit if isinstance(page_limit, int) and page_limit > 0 else limit
+            start += step
+            if isinstance(declared, int) and start >= declared:
+                generation['pagination_complete'] = True
+                break
+            if max_pages and pages_done >= max_pages:
+                generation['errors'].append('page_limit_reached')
+                break
+            if parsed['current_count'] == 0:
+                generation['errors'].append('premature_empty_page')
+                break
+        control.check()
+        expected = generation['declared_total']
+        if not isinstance(expected, int) or len(seen) != expected:
+            generation['errors'].append('observed_total_mismatch')
+        generation['complete'] = generation['pagination_complete'] and not generation['errors']
+        generation['status'] = 'completed' if generation['complete'] else 'partial'
+        persist()
+        if generation['complete']:
+            state.set_meta('index_last_complete', generation)
+    except BaseException as exc:
+        generation['status'] = 'stopped' if isinstance(exc, (TaskStopped, KeyboardInterrupt)) else 'failed'
+        generation['errors'].append(type(exc).__name__)
+        persist()
+        raise
+    stats = {'total_count_api': generation['declared_total'], 'pages_fetched': pages_done,
+             'unique_keys': len(seen), 'duplicate_keys': sorted(set(duplicates)),
+             'rows_missing_key': missing, 'indexed': len(seen), 'historical_indexed': state.count_records(),
+             'types': state.type_counts(), 'index_run_id': run_id,
+             'index_complete': generation['complete'], 'failed': int(not generation['complete'])}
+    state.set_meta('index_stats', stats)
+    state.set_meta('indexed_at', utcnow_iso())
     export_master_index(config, state)
-    log("INDEX", f"完成：索引 {stats['indexed']} 条 / API 声明 {total_count}，类型 {stats['types']}")
     return stats
 
 
@@ -219,13 +240,14 @@ def _fetch_one(
 
     state.mark_attempt(key)
     detail_url = record.get("detail_url") or config.detail_url(key, record.get("type") or "page")
-    detail_path = config.detail_dir / f"{key}.html"
+    detail_path = config.detail_dir / f"{safe_key_dirname(key)}.html"
 
     # ---- 1. 详情页 ----
     try:
         if detail_path.exists() and not force:
-            detail_html = read_text(detail_path) or ""
-            detail_sha = sha256_bytes(detail_html.encode("utf-8"))
+            snapshot = read_raw(detail_path)
+            detail_html = snapshot.text
+            detail_sha = snapshot.sha256
         else:
             response = client.get(detail_url, expect="html")
             meta = save_raw(
@@ -257,10 +279,10 @@ def _fetch_one(
     state.update_item(key, iframe_url=iframe_url)
 
     # ---- 3. 正文页 ----
-    content_path = config.content_dir / f"{key}.html"
+    content_path = config.content_dir / f"{safe_key_dirname(key)}.html"
     try:
         if content_path.exists() and not force:
-            content_sha = sha256_bytes((read_text(content_path) or "").encode("utf-8"))
+            content_sha = read_raw(content_path).sha256
         else:
             try:
                 response = client.get(iframe_url, expect="html")
@@ -269,9 +291,10 @@ def _fetch_one(
                 if exc.status in (401, 403, 404) or exc.status is None:
                     log("RETRY", f"key={key} 正文签名可能过期，回详情页重取 iframe")
                     fresh = client.get(detail_url, expect="html")
-                    save_raw(detail_path, fresh.content, url=detail_url,
-                             status_code=fresh.status_code, headers=fresh.headers,
-                             extra={"stage": "detail", "key": key, "refreshed": True})
+                    refreshed_meta = save_raw(detail_path, fresh.content, url=detail_url,
+                                              status_code=fresh.status_code, headers=fresh.headers,
+                                              extra={"stage": "detail", "key": key, "refreshed": True})
+                    state.update_item(key, detail_sha256=refreshed_meta["sha256"], detail_fetched_at=utcnow_iso())
                     refreshed = parse_detail_html(fresh.text, base_url=detail_url).get("iframe_url")
                     if not refreshed:
                         raise
@@ -290,6 +313,9 @@ def _fetch_one(
             )
             content_sha = meta["sha256"]
         state.advance_status(key, "content_fetched", content_fetched_at=utcnow_iso(), content_sha256=content_sha)
+        if item.get("content_sha256") != content_sha:
+            # 新的原始正文需要重新派生；旧版文件保留，当前版本的状态重新开始。
+            state.update_item(key, status="content_fetched", parsed_at=None, assets_done_at=None)
         state.clear_failures(key)
         return "ok"
     except FetchError as exc:
@@ -313,7 +339,7 @@ def run_fetch(
     """抓取所有 page 类型的 detail + content 原始 HTML。"""
     config.ensure_dirs()
     records = [r for r in state.iter_records("page")]
-    if only_keys:
+    if only_keys is not None:
         wanted = set(only_keys)
         records = [r for r in records if r["key"] in wanted]
     if not force:
@@ -334,22 +360,23 @@ def run_fetch(
     done = 0
     aborted: str | None = None
 
-    with ThreadPoolExecutor(max_workers=max(1, config.concurrency)) as pool:
-        futures = {
-            pool.submit(_fetch_one, config, state, client, record, log, force): record
-            for record in records
-        }
+    control = getattr(client, "control", None) or TaskControl()
+    with closing(bounded_results(
+        records, lambda record: _fetch_one(config, state, client, record, log, force),
+        workers=config.concurrency, control=control,
+    )) as results:
         try:
-            for future in as_completed(futures):
-                record = futures[future]
+            for record, future in results:
                 done += 1
                 try:
                     result = future.result()
                 except AuthExpired as exc:
                     aborted = str(exc)
-                    for pending in futures:
-                        pending.cancel()
-                    break
+                    control.stop()
+                    state.update_item(record["key"], status="auth_error", last_error="认证失效")
+                    continue
+                except TaskStopped:
+                    continue
                 except Exception as exc:  # noqa: BLE001 —— 单条异常不应终止整批
                     counters["failed"] += 1
                     state.update_item(record["key"], status="failed", last_error=str(exc)[:500])
@@ -363,6 +390,8 @@ def run_fetch(
                     log("SKIP", f"{done}/{total} key={record['key']} 已完成")
         except AuthExpired as exc:
             aborted = str(exc)
+    if control.stopped and not aborted:
+        raise TaskStopped("抓取已停止，已保存数据可续传")
 
     stats = {"total": total, **counters, "aborted": aborted}
     if aborted:
@@ -382,56 +411,89 @@ def run_parse(
     log: Logger = _noop,
     force: bool = False,
     limit: int | None = None,
+    only_keys: list[str] | None = None,
+    control: TaskControl | None = None,
 ) -> dict[str, Any]:
     """从 raw/ 重建 metadata.json + content.original.html。不发任何网络请求。"""
     config.ensure_dirs()
     records = state.iter_records("page")
+    if only_keys is not None:
+        wanted = set(only_keys)
+        records = [record for record in records if record["key"] in wanted]
     if limit:
         records = records[:limit]
 
+    control = control or TaskControl()
+    from .truth import resource_fingerprint
     counters = {"parsed": 0, "warning": 0, "missing_raw": 0, "skip": 0}
     for record in records:
+        control.check()
         key = record["key"]
         item = state.get_item(key) or {}
-        if item.get("status") in {"parsed", "assets_partial", "complete"} and not force:
-            counters["skip"] += 1
-            continue
-
-        content_path = config.content_dir / f"{key}.html"
-        if not content_path.exists():
+        content_base = config.content_dir / f"{safe_key_dirname(key)}.html"
+        if not content_base.exists():
             counters["missing_raw"] += 1
             continue
 
-        raw_html = read_text(content_path) or ""
-        parsed = parse_content_html(raw_html)
-        detail_path = config.detail_dir / f"{key}.html"
-        detail_info = parse_detail_html(read_text(detail_path) or "", base_url=record.get("detail_url"))
+        content_snapshot = read_raw(content_base)
+        content_path = content_snapshot.path
+        detail_base = config.detail_dir / f"{safe_key_dirname(key)}.html"
+        detail_snapshot = read_raw(detail_base) if detail_base.exists() else None
+        detail_path = detail_snapshot.path if detail_snapshot else detail_base
 
         item_dir = config.item_dir(key)
         item_dir.mkdir(parents=True, exist_ok=True)
+        previous = read_json(item_dir / "metadata.json", {}) or {}
+        try:
+            parsed_current = current_content_path(item_dir, prefer_local=False).is_file()
+        except (IntegrityError, OSError):
+            parsed_current = False
+        if (parsed_current and previous.get('resource_fingerprint') == resource_fingerprint(
+                previous.get('parsed_sha256'), previous.get('iframe_url_original'), state.assets_for(key))
+                and item.get("status") in {"parsed", "assets_partial", "complete"} and not force
+                and previous.get("content_sha256") == content_snapshot.sha256
+                and previous.get("detail_sha256") == (detail_snapshot.sha256 if detail_snapshot else None)):
+            counters["skip"] += 1
+            continue
+
+        parsed = parse_content_html(content_snapshot.text)
+        detail_info = parse_detail_html(detail_snapshot.text if detail_snapshot else "", base_url=record.get("detail_url"))
 
         content_html = parsed["content_html"] or ""
-        # content.original.html 是正文容器的 inner HTML 原样，之后永不被任何阶段修改
-        write_text_atomic(item_dir / "content.original.html", content_html)
+        original = item_dir / "content.original.html"
+        if not original.exists() and parsed["has_container"]:
+            write_once(original, content_html.encode("utf-8"))
+        original_sha = sha256_file(original) if original.exists() else None
+        if previous.get("original_sha256") and previous["original_sha256"] != original_sha:
+            raise IntegrityError(f"首次正文校验失败：{key}")
+        parsed_sha = sha256_bytes(content_html.encode("utf-8")) if parsed["has_container"] else None
+        if parsed_sha:
+            write_once(item_dir / "parsed" / f"{parsed_sha}.html", content_html.encode("utf-8"))
 
         import json as _json
 
         warnings: list[str] = []
         if not parsed["has_container"]:
-            warnings.append("未找到正文容器（页面结构可能已变更）")
-        if parsed["content_length"] == 0:
+            warnings.append("源站返回页面不存在，正文尚未取回" if parsed["page_error"] == "source_unavailable"
+                            else "未找到正文容器（页面结构可能已变更）")
+        if parsed["content_length"] == 0 and not parsed["has_media"]:
             warnings.append("正文长度为 0")
         if not parsed["has_title"]:
             warnings.append("未找到标题节点")
         if not parsed["has_footer"]:
             warnings.append("未找到 footer（日期/来源可能缺失）")
         list_desc = record.get("list_desc") or ""
-        if len(list_desc) > 50 and parsed["content_length"] == 0:
+        if len(list_desc) > 50 and parsed["content_length"] == 0 and not parsed["has_media"]:
             warnings.append("列表摘要有内容但正文为空 —— 高度可疑")
 
-        assets = extract_assets(content_html, base_url=item.get("iframe_url") or detail_info.get("iframe_url"))
+        base_url = detail_info.get("iframe_url") or item.get("iframe_url")
+        assets = extract_assets(content_html, base_url=base_url)
+        fingerprint = resource_fingerprint(parsed_sha, base_url, assets)
+        same_parsed = previous.get('resource_fingerprint') == fingerprint
+        state.update_item(key, iframe_url=base_url)
         for asset in assets:
             state.upsert_asset(key, asset)
+        state.set_current_assets(key, assets)
 
         metadata = {
             "key": key,
@@ -457,23 +519,43 @@ def run_parse(
             "detail_url": record.get("detail_url"),
             "external_url": record.get("external_url"),
             # 完整签名 URL 只存在于本地 metadata，用于将来复原；日志/报告中一律打码
-            "iframe_url_original": item.get("iframe_url") or detail_info.get("iframe_url"),
-            "iframe_url_redacted": redact_url(item.get("iframe_url") or detail_info.get("iframe_url") or ""),
+            "iframe_url_original": base_url,
+            "iframe_url_redacted": redact_url(base_url or ""),
             "list_offset": record.get("list_offset"),
             "position_in_page": record.get("position_in_page"),
             "global_position": record.get("global_position"),
             "content_length": parsed["content_length"],
             "content_html_length": parsed["content_html_length"],
+            "has_content_container": parsed["has_container"],
+            "has_media": parsed["has_media"],
+            "page_error": parsed["page_error"],
             "raw_detail_path": str(detail_path.relative_to(config.root)) if detail_path.exists() else None,
             "raw_content_path": str(content_path.relative_to(config.root)),
-            "detail_sha256": item.get("detail_sha256"),
-            "content_sha256": item.get("content_sha256"),
-            "assets": [],
+            "detail_sha256": detail_snapshot.sha256 if detail_snapshot else None,
+            "content_sha256": content_snapshot.sha256,
+            "original_sha256": original_sha,
+            "original_raw_content_path": (previous.get("original_raw_content_path") or
+                (previous.get("raw_content_path") if previous.get("original_sha256") else None) or
+                (str(content_path.relative_to(config.root)) if original_sha else None)),
+            "original_raw_content_sha256": (previous.get("original_raw_content_sha256") or
+                (previous.get("content_sha256") if previous.get("original_sha256") else None) or
+                (content_snapshot.sha256 if original_sha else None)),
+            "parsed_sha256": parsed_sha,
+            "resource_fingerprint": fingerprint,
+            "localized_resource_fingerprint": previous.get('localized_resource_fingerprint') if same_parsed else None,
+            "include_media": previous.get('include_media', False),
+            "parsed_content_path": f"parsed/{parsed_sha}.html" if parsed_sha else None,
+            "localized_from_sha256": previous.get("localized_from_sha256") if same_parsed else None,
+            "localized_sha256": previous.get("localized_sha256") if same_parsed else None,
+            "localization_version": previous.get("localization_version") if same_parsed else None,
+            "assets": previous.get("assets", []) if same_parsed else [],
             "asset_count_discovered": len(assets),
             "archived_at": utcnow_iso(),
             "first_attempt_at": item.get("first_attempt_at"),
             "last_attempt_at": item.get("last_attempt_at"),
-            "status": "warning" if warnings else "parsed",
+            "status": "warning" if warnings else (
+                item.get("status") if same_parsed and item.get("status") in {"complete", "assets_partial"} else "parsed"
+            ),
             "warnings": warnings,
             "errors": [],
         }
@@ -489,7 +571,11 @@ def run_parse(
             source=parsed["source"],
             content_length=parsed["content_length"],
             warning="; ".join(warnings) or None,
+            detail_sha256=detail_snapshot.sha256 if detail_snapshot else None,
+            content_sha256=content_snapshot.sha256,
         )
+        if not same_parsed:
+            state.update_item(key, status="parsed", assets_done_at=None)
         if warnings:
             state.update_item(key, status="warning")
             counters["warning"] += 1
@@ -497,6 +583,7 @@ def run_parse(
         else:
             counters["parsed"] += 1
 
+    control.check()
     log("PARSE", f"完成：解析 {counters['parsed']}，警告 {counters['warning']}，"
                  f"缺少 raw {counters['missing_raw']}，跳过 {counters['skip']}")
     return counters

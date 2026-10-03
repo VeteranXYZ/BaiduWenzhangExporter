@@ -7,13 +7,16 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 from .auth import Credentials
 from .config import Config
 from .parsers import looks_like_login_page
-from .utils import redact_url
+from .tasks import TaskControl
+from .storage import save_raw
+from .utils import decode_response_bytes, redact_url, sha256_bytes
 
 
 class AuthExpired(RuntimeError):
@@ -38,35 +41,25 @@ class Response:
 
     @property
     def text(self) -> str:
-        """老页面编码混乱，一律按 UTF-8 宽松解码，原始字节仍存于 content。"""
-        encoding = None
-        content_type = self.headers.get("content-type", "")
-        if "charset=" in content_type:
-            encoding = content_type.split("charset=")[-1].split(";")[0].strip().strip('"')
-        for candidate in (encoding, "utf-8", "gb18030"):
-            if not candidate:
-                continue
-            try:
-                return self.content.decode(candidate)
-            except (UnicodeDecodeError, LookupError):
-                continue
-        return self.content.decode("utf-8", "replace")
+        return decode_response_bytes(self.content, self.headers)
 
 
 class RateLimiter:
     """全局串行化的最小请求间隔，带抖动。低并发下比令牌桶更可预测。"""
 
-    def __init__(self, delay: float, jitter: float):
+    def __init__(self, delay: float, jitter: float, control: TaskControl | None = None):
         self.delay = max(0.0, delay)
         self.jitter = max(0.0, jitter)
         self._lock = threading.Lock()
         self._next_at = 0.0
+        self.control = control or TaskControl()
 
     def wait(self) -> None:
         with self._lock:
+            self.control.check()
             now = time.monotonic()
             if now < self._next_at:
-                time.sleep(self._next_at - now)
+                self.control.wait(self._next_at - now)
                 now = time.monotonic()
             self._next_at = now + self.delay + random.uniform(0, self.jitter)
 
@@ -74,11 +67,12 @@ class RateLimiter:
 class ArchiveClient:
     """只读 HTTP 客户端。所有对外日志中的 URL 均已打码。"""
 
-    def __init__(self, config: Config, credentials: Credentials, *, logger=None):
+    def __init__(self, config: Config, credentials: Credentials, *, logger=None, control: TaskControl | None = None):
         self.config = config
         self.credentials = credentials
         self.logger = logger
-        self.limiter = RateLimiter(config.delay, config.jitter)
+        self.control = control or TaskControl()
+        self.limiter = RateLimiter(config.delay, config.jitter, self.control)
         self._auth_streak = 0
         self._streak_lock = threading.Lock()
 
@@ -91,11 +85,9 @@ class ArchiveClient:
         }
         headers.update({k.title(): v for k, v in (credentials.extra_headers or {}).items()})
         headers.update(config.extra_headers or {})
-        if credentials.cookie_header:
-            headers["Cookie"] = credentials.cookie_header
-
         self._client = httpx.Client(
             headers=headers,
+            event_hooks={"request": [self._scope_credentials]},
             timeout=httpx.Timeout(
                 connect=config.connect_timeout,
                 read=config.read_timeout,
@@ -105,6 +97,19 @@ class ArchiveClient:
             follow_redirects=True,
             limits=httpx.Limits(max_connections=max(2, config.concurrency * 2)),
         )
+
+    def _scope_credentials(self, request: httpx.Request) -> None:
+        """登录凭证仅用于收藏站点；每次重定向也重新检查目标。"""
+        self.control.check()
+        trusted = urlparse(self.config.site_root)
+        request.headers.pop('cookie', None)  # also remove httpx's response-cookie jar header
+        if request.url.scheme == "https" and request.url.host == trusted.hostname:
+            cookie = self.credentials.header_for(str(request.url))
+            if cookie:
+                request.headers["Cookie"] = cookie
+        else:
+            for name in ("cookie", "authorization", "proxy-authorization", "referer", "origin"):
+                request.headers.pop(name, None)
 
     # ------------------------------------------------------------------
     def close(self) -> None:
@@ -130,6 +135,7 @@ class ArchiveClient:
                 self._auth_streak = 0
                 return
         if streak >= self.config.auth_failure_threshold:
+            self.control.stop()
             raise AuthExpired(
                 f"连续 {streak} 次请求出现认证失效特征，已停止任务。"
                 "请重新导出 Cookie 后再运行（已成功归档的内容不受影响）。"
@@ -176,7 +182,8 @@ class ArchiveClient:
                 last_error = f"超时: {type(exc).__name__}"
                 last_status = None
             except httpx.HTTPError as exc:
-                last_error = f"传输失败: {type(exc).__name__}: {exc}"
+                # HTTP 库的异常消息可能包含完整签名 URL，日志只记录异常类型。
+                last_error = f"传输失败: {type(exc).__name__}"
                 last_status = None
             else:
                 elapsed = time.monotonic() - started
@@ -207,6 +214,11 @@ class ArchiveClient:
                     elif expect == "json":
                         text_sample = body[:2000].decode("utf-8", "replace").lstrip()
                         suspicious = looks_like_login_page(text_sample) or not text_sample.startswith(("{", "["))
+                    if suspicious:
+                        # 先保留响应，误判也能离线检查；不把疑似登录页写成文章原件。
+                        path = self.config.raw_dir / "unexpected_responses" / (sha256_bytes(url.encode()) + ".html")
+                        save_raw(path, body, url=url, status_code=status, headers=headers,
+                                 extra={"stage": "unexpected_response"})
                     self._note_auth(suspicious)
                     if suspicious:
                         last_error = "响应疑似登录页/非预期结构（HTTP 200）"
@@ -224,7 +236,7 @@ class ArchiveClient:
                 backoff = self.config.backoff_base * (2 ** (attempt - 1))
                 backoff += random.uniform(0, self.config.jitter)
                 self._log("RETRY", f"{safe_url} — {last_error}（第 {attempt}/{retries} 次），{backoff:.1f}s 后重试")
-                time.sleep(backoff)
+                self.control.wait(backoff)
 
         raise FetchError(f"{last_error}（已重试 {retries} 次）", status=last_status, attempts=retries)
 
@@ -234,7 +246,7 @@ class ArchiveClient:
             self.limiter.wait()
             raw = self._client.get(url)
         except httpx.HTTPError as exc:
-            return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "url_redacted": redact_url(url)}
+            return {"ok": False, "error": type(exc).__name__, "url_redacted": redact_url(url)}
         sample = raw.content[:2000].decode("utf-8", "replace").lstrip()
         return {
             "ok": raw.status_code == 200 and sample.startswith("{"),

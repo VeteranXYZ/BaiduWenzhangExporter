@@ -10,11 +10,19 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
 from .utils import utcnow_iso
+
+SCHEMA_VERSION = 1
+
+
+class SchemaVersionError(RuntimeError):
+    """数据库由更新的程序创建，当前版本不能安全修改。"""
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -87,10 +95,21 @@ CREATE TABLE IF NOT EXISTS assets (
     sha256             TEXT,
     size               INTEGER,
     error              TEXT,
+    active             INTEGER NOT NULL DEFAULT 1,
+    resource_identity  TEXT,
+    download_identity  TEXT,
     UNIQUE(key, original_url, attribute)
 );
 CREATE INDEX IF NOT EXISTS idx_assets_key    ON assets(key);
 CREATE INDEX IF NOT EXISTS idx_assets_status ON assets(download_status);
+
+CREATE TABLE IF NOT EXISTS asset_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    record_json TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS failures (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,16 +154,47 @@ class ArchiveState:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30.0)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=FULL")  # 归档场景：宁可慢也不丢
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        with self._lock:
-            self._conn.executescript(SCHEMA)
-            self._migrate()
+        try:
+            # Check before changing even journal settings on a future schema.
+            version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version > SCHEMA_VERSION:
+                raise SchemaVersionError("数据库版本较新，请使用创建它的程序版本")
+            # Journal mode transition itself may return BUSY immediately, even
+            # with busy_timeout. Retry only lock contention within the same bound.
+            deadline = time.monotonic() + 30.0
+            while True:
+                try:
+                    self._conn.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if 'locked' not in str(exc).lower() or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
+            self._conn.execute("PRAGMA synchronous=FULL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            # SQLite, rather than an instance lock, serializes all connections/processes.
+            self._conn.execute("BEGIN IMMEDIATE")
+            version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version > SCHEMA_VERSION:
+                raise SchemaVersionError("数据库版本较新，请升级程序")
+            if version < SCHEMA_VERSION:
+                # executescript commits an existing transaction. Execute DDL ourselves.
+                for statement in SCHEMA.split(';'):
+                    if statement.strip():
+                        self._conn.execute(statement)
+                self._migrate()
+                self._conn.execute("PRAGMA user_version=" + str(SCHEMA_VERSION))
             self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            self._conn.close()
+            raise
 
     # 归档工具不能因为加了一列就让已有 state.db 作废，故做幂等的补列迁移。
-    _MIGRATIONS = (("records", "list_source", "TEXT"),)
+    _MIGRATIONS = (("records", "list_source", "TEXT"),
+                   ("assets", "active", "INTEGER NOT NULL DEFAULT 1"),
+                   ("assets", "resource_identity", "TEXT"),
+                   ("assets", "download_identity", "TEXT"))
 
     def _migrate(self) -> None:
         for table, column, coltype in self._MIGRATIONS:
@@ -327,16 +377,25 @@ class ArchiveState:
 
     # ---------------- assets ----------------
     def upsert_asset(self, key: str, asset: dict[str, Any]) -> None:
+        from .truth import resource_identity
+        identity = resource_identity({**asset, 'key': key})
         with self._tx() as conn:
+            old = conn.execute('SELECT * FROM assets WHERE key=? AND original_url=? AND attribute=?',
+                               (key, asset['original_url'], asset['attribute'])).fetchone()
+            if old and resource_identity(dict(old)) != identity:
+                self._remember_asset(conn, dict(old), 'resolved_url_changed')
+                conn.execute('''UPDATE assets SET download_attempted=0, download_status=NULL,
+                    http_status=NULL, content_type=NULL, local_path=NULL, sha256=NULL, size=NULL,
+                    error=NULL, download_identity=NULL WHERE id=?''', (old['id'],))
             conn.execute(
                 """
                 INSERT INTO assets(key,kind,element_type,attribute,original_url,resolved_url,
-                                   scheme_kind,domain,downloadable)
-                VALUES(?,?,?,?,?,?,?,?,?)
+                                   scheme_kind,domain,downloadable,resource_identity)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(key,original_url,attribute) DO UPDATE SET
                     kind=excluded.kind, resolved_url=excluded.resolved_url,
                     scheme_kind=excluded.scheme_kind, domain=excluded.domain,
-                    downloadable=excluded.downloadable
+                    downloadable=excluded.downloadable, resource_identity=excluded.resource_identity
                 """,
                 (
                     key,
@@ -348,34 +407,70 @@ class ArchiveState:
                     asset.get("scheme_kind"),
                     asset.get("domain"),
                     1 if asset.get("downloadable") else 0,
+                    identity,
                 ),
             )
 
     def record_asset_result(self, key: str, original_url: str, attribute: str, **fields: Any) -> None:
         if not fields:
             return
-        columns = ", ".join(f"{name}=?" for name in fields)
         with self._tx() as conn:
+            row = conn.execute('SELECT * FROM assets WHERE key=? AND original_url=? AND attribute=?',
+                               (key, original_url, attribute)).fetchone()
+            if row:
+                old = dict(row)
+                if fields.get('download_status') == 'ok':
+                    from .truth import resource_identity
+                    fields.setdefault('download_identity', resource_identity(old))
+                replacement = any(name in fields and fields[name] != old.get(name)
+                                  for name in ('local_path', 'sha256', 'size', 'download_identity', 'download_status'))
+                if old.get('download_status') == 'ok' and old.get('local_path') and replacement:
+                    self._remember_asset(conn, old, 'download_replaced')
+            columns = ", ".join(f"{name}=?" for name in fields)
             conn.execute(
                 f"UPDATE assets SET {columns} WHERE key=? AND original_url=? AND attribute=?",
                 (*fields.values(), key, original_url, attribute),
             )
 
-    def assets_for(self, key: str) -> list[dict[str, Any]]:
+    def _remember_asset(self, conn, asset: dict, reason: str) -> None:
+        conn.execute('INSERT INTO asset_history(key,recorded_at,reason,record_json) VALUES(?,?,?,?)',
+                     (asset['key'], utcnow_iso(), reason, json.dumps(asset, ensure_ascii=False)))
+
+    def invalidate_asset(self, asset: dict, reason: str) -> None:
+        """Retain the old path/hash as evidence; never delete the actual file."""
+        with self._tx() as conn:
+            self._remember_asset(conn, asset, reason)
+            conn.execute('''UPDATE assets SET download_status='pending', download_identity=NULL,
+                local_path=NULL, sha256=NULL, size=NULL, error=? WHERE id=?''', (reason, asset['id']))
+
+    def asset_history(self, key: str) -> list[dict]:
         with self._lock:
-            rows = self._conn.execute("SELECT * FROM assets WHERE key=? ORDER BY id", (key,)).fetchall()
+            rows = self._conn.execute('SELECT * FROM asset_history WHERE key=? ORDER BY id', (key,)).fetchall()
+        return [{**dict(r), 'record': json.loads(r['record_json'])} for r in rows]
+
+    def set_current_assets(self, key: str, assets: list[dict[str, Any]]) -> None:
+        """只切换当前正文的资源集合，历史资源记录与下载文件仍保留。"""
+        with self._tx() as conn:
+            conn.execute("UPDATE assets SET active=0 WHERE key=?", (key,))
+            conn.executemany("UPDATE assets SET active=1 WHERE key=? AND original_url=? AND attribute=?",
+                             [(key, a["original_url"], a["attribute"]) for a in assets])
+
+    def assets_for(self, key: str, *, include_inactive: bool = False) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM assets WHERE key=?" +
+                                      ("" if include_inactive else " AND active=1") + " ORDER BY id", (key,)).fetchall()
         return [dict(r) for r in rows]
 
     def all_assets(self) -> list[dict[str, Any]]:
         with self._lock:
-            rows = self._conn.execute("SELECT * FROM assets ORDER BY key, id").fetchall()
+            rows = self._conn.execute("SELECT * FROM assets WHERE active=1 ORDER BY key, id").fetchall()
         return [dict(r) for r in rows]
 
     def asset_counts(self) -> dict[str, int]:
         with self._lock:
-            total = int(self._conn.execute("SELECT COUNT(*) AS n FROM assets").fetchone()["n"])
+            total = int(self._conn.execute("SELECT COUNT(*) AS n FROM assets WHERE active=1").fetchone()["n"])
             rows = self._conn.execute(
-                "SELECT download_status, COUNT(*) AS n FROM assets WHERE download_attempted=1 GROUP BY download_status"
+                "SELECT download_status, COUNT(*) AS n FROM assets WHERE active=1 AND download_attempted=1 GROUP BY download_status"
             ).fetchall()
         counts = {"discovered": total}
         for row in rows:
@@ -423,6 +518,43 @@ class ArchiveState:
                 "UPDATE runs SET finished_at=?, stats_json=? WHERE id=?",
                 (utcnow_iso(), json.dumps(stats, ensure_ascii=False), run_id),
             )
+
+    @contextmanager
+    def tracked_run(self, command: str) -> Iterator[dict[str, Any]]:
+        """保存正常完成、认证中止、手动停止与异常结果，不保存异常中的敏感文本。"""
+        from .client import AuthExpired
+        from .tasks import TaskStopped
+
+        run_id = self.start_run(command)
+        stats: dict[str, Any] = {}
+        try:
+            yield stats
+            stats["outcome"] = ("auth_error" if stats.get("aborted") else
+                                "partial" if stats.get("failed") or stats.get("warning") or stats.get("missing_raw") or stats.get("incomplete_items") else
+                                "completed")
+        except (KeyboardInterrupt, TaskStopped):
+            stats["outcome"] = "stopped"
+            raise
+        except AuthExpired:
+            stats["outcome"] = "auth_error"
+            raise
+        except BaseException as exc:
+            stats.update(outcome="failed", error_type=type(exc).__name__)
+            raise
+        finally:
+            if stats.get('outcome') != 'completed':
+                stats.pop('download', None)
+            self.finish_run(run_id, stats)
+
+    def recent_runs(self, limit: int = 10) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (max(1, min(limit, 100)),)).fetchall()
+        results = []
+        for row in rows:
+            data = dict(row)
+            data["stats"] = json.loads(data.pop("stats_json") or "{}")
+            results.append(data)
+        return results
 
     # ---------------- 一致性检查 ----------------
     def duplicate_titles(self) -> list[dict[str, Any]]:

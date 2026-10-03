@@ -55,25 +55,39 @@ def parse_list_json(payload: str | bytes | dict) -> dict[str, Any]:
         raise ListResponseError("列表响应顶层不是对象")
 
     status = payload.get("status")
+    if not ((type(status) is int and status == 0) or (type(status) is str and status == "0")):
+        raise ListResponseError("列表接口返回非成功状态（请检查登录态）")
     data = payload.get("data")
     if not isinstance(data, dict):
-        raise ListResponseError(f"列表响应缺少 data 对象（status={status}, msg={payload.get('msg')!r}）")
+        raise ListResponseError("列表响应缺少 data 对象")
+    def strict_integer(name: str, default=None) -> int:
+        value = data.get(name, default)
+        if type(value) is int:
+            result = value
+        elif type(value) is str and re.fullmatch(r"0|[1-9][0-9]*", value):
+            try:
+                result = int(value)
+            except ValueError as exc:
+                raise ListResponseError("列表整数过长: " + name) from exc
+        else:
+            raise ListResponseError("列表字段必须是非负整数: " + name)
+        if result < 0:
+            raise ListResponseError("列表字段不能为负数: " + name)
+        return result
 
-    def _int(name: str, default: int = 0) -> int:
-        try:
-            return int(data.get(name, default))
-        except (TypeError, ValueError):
-            return default
+    total_count = strict_integer("totalCount")
+    if data.get("html") is not None and not isinstance(data["html"], str):
+        raise ListResponseError("列表响应 html 不是字符串")
 
     return {
         "status": status,
         "msg": payload.get("msg"),
         "request_id": payload.get("request_id"),
         "html": data.get("html") or "",
-        "start": _int("start"),
-        "limit": _int("limit", 30),
-        "total_count": _int("totalCount"),
-        "current_count": _int("currentCount"),
+        "start": strict_integer("start", 0),
+        "limit": strict_integer("limit", 30),
+        "total_count": total_count,
+        "current_count": strict_integer("currentCount", 0),
         "current_tag": data.get("currentTag"),
     }
 
@@ -358,6 +372,9 @@ def parse_content_html(html: str) -> dict[str, Any]:
         text = content_node.get_text("\n", strip=True)
 
     page_title_tag = soup.find("title")
+    page_title = page_title_tag.get_text(strip=True) if page_title_tag else None
+    page_error = ("source_unavailable" if content_node is None and page_title and
+                  any(marker in page_title for marker in ("页面不存在", "页面未找到", "404")) else None)
     return {
         "title": title,
         "content_tags": content_tags,
@@ -371,7 +388,9 @@ def parse_content_html(html: str) -> dict[str, Any]:
         "content_date_text": time_text,
         "content_date": normalize_date(time_text),
         "source": source,
-        "page_title": page_title_tag.get_text(strip=True) if page_title_tag else None,
+        "page_title": page_title,
+        "page_error": page_error,
+        "has_media": bool(content_node and content_node.find(["img", "video", "audio", "embed", "object", "iframe"])),
         "has_container": content_node is not None,
         "has_title": title_node is not None,
         "has_footer": footer_node is not None,
@@ -401,6 +420,38 @@ IMAGE_LIKE = frozenset({"image"})
 MEDIA_LIKE = frozenset({"video", "audio", "media-source", "embed", "object"})
 
 
+def parse_srcset(value: str) -> list[tuple[str, str]]:
+    """读取 URL + 原始 w/x 描述符；URL 中的逗号（如 data URI）不是分隔符。
+
+    按 HTML srcset 的空白/逗号边界读取，不把宽度转换成密度。
+    """
+    candidates = []
+    position = 0
+    whitespace = ' \t\n\r\f'
+    while position < len(value):
+        while position < len(value) and value[position] in whitespace + ',':
+            position += 1
+        start = position
+        while position < len(value) and value[position] not in whitespace:
+            position += 1
+        url = value[start:position]
+        descriptor = ''
+        if url.endswith(','):
+            url = url.rstrip(',')
+        else:
+            start = position
+            while position < len(value) and value[position] != ',':
+                position += 1
+            descriptor = value[start:position].strip()
+            position += 1
+        valid = not descriptor or bool(re.fullmatch(r'[1-9]\d*w', descriptor))
+        if re.fullmatch(r'(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?x', descriptor):
+            valid = float(descriptor[:-1]) > 0
+        if url and valid:
+            candidates.append((html_module.unescape(url), descriptor))
+    return candidates
+
+
 def extract_assets(content_html: str, *, base_url: str | None = None) -> list[dict[str, Any]]:
     """扫描正文中所有远程资源引用。
 
@@ -428,7 +479,8 @@ def extract_assets(content_html: str, *, base_url: str | None = None) -> list[di
                 resolved = urljoin(base_url, raw)
                 scheme_kind = url_scheme_kind(resolved)
 
-            dedupe = (kind, attr, resolved)
+            # Retain raw aliases; the download phase deduplicates by resolved URL.
+            dedupe = (kind, attr, raw)
             if dedupe in seen:
                 continue
             seen.add(dedupe)
@@ -448,14 +500,10 @@ def extract_assets(content_html: str, *, base_url: str | None = None) -> list[di
                 }
             )
 
-        # srcset 单独处理：逗号分隔的候选列表
+        # picture 的 source 也是图片；保留 attribute 以便与本地化共享候选解析。
         if selector == "img" and attr == "src":
-            for node in soup.select("img[srcset]"):
-                for candidate in str(node.get("srcset") or "").split(","):
-                    url = candidate.strip().split(" ")[0]
-                    if not url:
-                        continue
-                    url = html_module.unescape(url)
+            for node in soup.select("img[srcset], picture source[srcset]"):
+                for url, _ in parse_srcset(str(node.get("srcset") or "")):
                     scheme_kind = url_scheme_kind(url)
                     resolved = url
                     if scheme_kind == "protocol-relative":
@@ -464,13 +512,13 @@ def extract_assets(content_html: str, *, base_url: str | None = None) -> list[di
                     elif scheme_kind == "relative" and base_url:
                         resolved = urljoin(base_url, url)
                         scheme_kind = url_scheme_kind(resolved)
-                    dedupe = ("image", "srcset", resolved)
+                    dedupe = ("image", "srcset", url)
                     if dedupe in seen:
                         continue
                     seen.add(dedupe)
                     assets.append(
                         {
-                            "element_type": "img",
+                            "element_type": node.name,
                             "attribute": "srcset",
                             "kind": "image",
                             "original_url": url,
@@ -505,4 +553,11 @@ def looks_like_login_page(html: str | None) -> bool:
     if not html:
         return False
     sample = html[:20000].lower()
+    # 历史正文可能引用“请先登录”或 passport 链接。已找到收藏正文/详情容器时，
+    # 不能仅凭正文词语判定账号失效。
+    soup = make_soup(sample)
+    if soup.select_one('[id^="detailarticlecontent_"]') is not None:
+        return False
+    if soup.select_one('iframe.pcs-article-iframe[src], iframe.__pcsarticleiframe[src]') is not None:
+        return False
     return any(marker.lower() in sample for marker in _LOGIN_MARKERS)

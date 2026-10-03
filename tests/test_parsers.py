@@ -1,6 +1,7 @@
 """解析器单测。fixture 均为脱敏构造数据，不含任何真实凭证。"""
 
 import pytest
+from pathlib import Path
 
 from baidu_archive.parsers import (
     ListResponseError,
@@ -15,6 +16,13 @@ from baidu_archive.parsers import (
 
 
 # ---------------- 列表 JSON ----------------
+
+def test_detail_observed_structure():
+    fixture = Path(__file__).parent / "fixtures" / "detail_observed_structure.html"
+    result = parse_detail_html(fixture.read_text(), base_url="https://wenzhang.baidu.com/page/view?key=fixture-page")
+    assert result["has_iframe"]
+    assert "&amp;" not in result["iframe_url"]
+    assert "&is_share=0&expire=FAKE_EXPIRY&sign=FAKE_SIGNATURE" in result["iframe_url"]
 
 def test_parse_list_json(list_response):
     parsed = parse_list_json(list_response)
@@ -34,6 +42,18 @@ def test_parse_list_json_rejects_non_json():
 def test_parse_list_json_rejects_missing_data():
     with pytest.raises(ListResponseError):
         parse_list_json('{"status":-1,"msg":"未登录"}')
+
+
+@pytest.mark.parametrize("payload", [
+    {"status": -1, "data": {"totalCount": 504, "html": ""}},
+    {"status": 0, "data": {}},
+    {"status": 0, "data": {"totalCount": -1}},
+    {"status": 0, "data": {"totalCount": "unknown"}},
+    {"status": 0, "data": {"totalCount": 0, "html": {}}},
+])
+def test_parse_list_json_does_not_report_invalid_response_as_empty_archive(payload):
+    with pytest.raises(ListResponseError):
+        parse_list_json(payload)
 
 
 # ---------------- 列表 HTML ----------------
@@ -248,6 +268,24 @@ def test_looks_like_login_page(login_page, content_page):
     assert looks_like_login_page(login_page) is True
     assert looks_like_login_page(content_page) is False
     assert looks_like_login_page("") is False
+
+
+@pytest.mark.parametrize("marker", ["请先登录", "登录百度账号", "https://passport.baidu.com/"])
+def test_archived_article_login_words_are_not_session_expiration(marker):
+    markup = f'<h1 id="detailArticleTitle_fixture">文章标题</h1><div id="detailArticleContent_fixture"><p>{marker}</p></div>'
+    assert looks_like_login_page(markup) is False
+
+
+def test_detail_with_login_link_and_real_iframe_is_not_login_page():
+    markup = '<a href="https://passport.baidu.com/">登录</a><iframe class="pcs-article-iframe" src="https://wenzhang.bdstatic.com/page/content/"></iframe>'
+    assert looks_like_login_page(markup) is False
+
+
+def test_content_distinguishes_image_only_article_from_missing_page():
+    image = parse_content_html('<h1 id="detailArticleTitle_test">照片</h1><div id="detailArticleContent_test"><img src="https://image.example/a.jpg"></div>')
+    assert image["has_container"] and image["has_media"] and image["content_length"] == 0
+    missing = parse_content_html('<title>页面不存在_百度搜索</title><p>很抱歉，您要访问的页面不存在！</p>')
+    assert not missing["has_container"] and missing["page_error"] == "source_unavailable"
 
 
 # ---------------- 正文页：真实结构补充项 ----------------

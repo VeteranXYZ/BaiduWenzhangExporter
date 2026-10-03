@@ -49,6 +49,22 @@ def utcnow_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def decode_response_bytes(content: bytes, headers: dict[str, str] | None = None) -> str:
+    """联网与离线解析使用相同编码规则，原始字节始终另存。"""
+    encoding = None
+    content_type = (headers or {}).get("content-type", "")
+    match = re.search(r"charset\s*=\s*['\"]?([^;'\"\s]+)", content_type, re.I)
+    if match:
+        encoding = match.group(1)
+    for candidate in (encoding, "utf-8", "gb18030"):
+        if candidate:
+            try:
+                return content.decode(candidate)
+            except (UnicodeDecodeError, LookupError):
+                pass
+    return content.decode("utf-8", "replace")
+
+
 def redact_url(url: str, extra_keys: Iterable[str] = ()) -> str:
     """把 URL 中的敏感 query 值替换为 ``<redacted>``。
 
@@ -67,7 +83,7 @@ def redact_url(url: str, extra_keys: Iterable[str] = ()) -> str:
     # keep_blank_values 保留 ``a=`` 这种空值参数，避免打码后丢字段。
     pairs = parse_qsl(parts.query, keep_blank_values=True)
     redacted = [(k, "<redacted>" if k.lower() in keys else v) for k, v in pairs]
-    return urlunparse(parts._replace(query=urlencode(redacted, safe="<>")))
+    return urlunparse(parts._replace(query=urlencode(redacted, safe="<>{}")))
 
 
 def redact_cookie(cookie_header: str) -> str:

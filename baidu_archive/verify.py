@@ -7,9 +7,11 @@ import io
 from typing import Any, Callable
 
 from .config import Config
+from .integrity import audit_stored_files
 from .state import ArchiveState
-from .storage import write_json_atomic, write_text_atomic
-from .utils import truncate, utcnow_iso
+from .truth import article_truth, index_truth, validate_downloaded_asset
+from .storage import read_json, write_json_atomic, write_text_atomic
+from .utils import redact_url, safe_key_dirname, truncate, utcnow_iso
 
 Logger = Callable[[str, str], None]
 
@@ -28,15 +30,40 @@ def _csv_text(rows: list[dict[str, Any]], columns: list[str]) -> str:
     return "﻿" + buffer.getvalue()
 
 
+def validation_result(summary: dict[str, Any]) -> dict[str, Any]:
+    """CLI 与操作台共用的完整性判定；只在所有要求都满足时通过。"""
+    pages = summary['baidu_space_pages']
+    expected, indexed = summary['api_total_count'], summary['indexed']
+    checks = {
+        'index_complete': summary['index_complete'] is True,
+        'counts_match': isinstance(expected, int) and expected == indexed,
+        'order_contiguous': summary['original_order']['contiguous'],
+        'no_problem_items': summary['problem_items'] == 0,
+        'pages_complete': pages['complete'] == pages['total'],
+        'raw_content_present': pages['raw_content_on_disk'] == pages['total'],
+        'original_content_present': pages['content_original_on_disk'] == pages['total'],
+        'no_empty_content': pages['empty_content'] == 0,
+        'no_failed_assets': summary['assets']['failed'] == 0,
+        'files_intact': summary['stored_file_integrity']['ok'],
+    }
+    return {'ok': all(checks.values()), 'expected': expected, 'indexed': indexed,
+            'missing': max(0, expected - indexed) if isinstance(expected, int) else None,
+            'excess': max(0, indexed - expected) if isinstance(expected, int) else None,
+            'problem_items': summary['problem_items'], 'checks': checks}
+
+
 def run_verify(config: Config, state: ArchiveState, *, log: Logger = _noop) -> dict[str, Any]:
     config.ensure_dirs()
 
-    total_api = state.get_meta("total_count")
-    indexed = state.count_records()
+    index = index_truth(state)
+    total_api = index['expected']
+    indexed = index['indexed']
     types = state.type_counts()
     statuses = state.status_counts()
 
     records = state.iter_records()
+    if index['run_id']:
+        records = [r for r in records if r['key'] in set(index['seen_keys'])]
     keys = [r["key"] for r in records]
     unique_keys = set(keys)
     duplicate_keys = sorted({k for k in keys if keys.count(k) > 1}) if len(keys) != len(unique_keys) else []
@@ -50,7 +77,7 @@ def run_verify(config: Config, state: ArchiveState, *, log: Logger = _noop) -> d
         position_gaps = [p for p in range(max(positions) + 1) if p not in present]
 
     # ---- page 类型逐阶段核对 ----
-    page_records = state.iter_records("page")
+    page_records = [r for r in records if r["type"] == "page"]
     page_total = len(page_records)
     # 进度计数（由时间戳推导）与状态计数（由 status 字段推导）必须分开，
     # 否则 status=="parsed" 会同时命中两边而被重复累加。
@@ -59,10 +86,11 @@ def run_verify(config: Config, state: ArchiveState, *, log: Logger = _noop) -> d
         "parsed": 0, "assets_complete": 0,
         "raw_detail_on_disk": 0, "raw_content_on_disk": 0,
         "content_original_on_disk": 0, "empty_content": 0,
+        "source_unavailable": 0,
     }
     status_breakdown = {
         "complete": 0, "warning": 0, "failed": 0, "auth_error": 0,
-        "pending": 0, "parsed": 0, "assets_partial": 0,
+        "pending": 0, "parsed": 0, "assets_partial": 0, "legacy_unverified": 0,
         "detail_fetched": 0, "content_fetched": 0,
     }
     problem_rows: list[dict[str, Any]] = []
@@ -70,7 +98,10 @@ def run_verify(config: Config, state: ArchiveState, *, log: Logger = _noop) -> d
     for record in page_records:
         key = record["key"]
         item = state.get_item(key) or {}
-        status = item.get("status", "pending")
+        status = article_truth(config, state, key)["status"]
+        metadata = read_json(config.item_dir(key) / "metadata.json", {}) or {}
+        if metadata.get("page_error") == "source_unavailable":
+            stage["source_unavailable"] += 1
 
         if item.get("detail_fetched_at"):
             stage["detail_fetched"] += 1
@@ -84,9 +115,9 @@ def run_verify(config: Config, state: ArchiveState, *, log: Logger = _noop) -> d
         if status == "complete":
             stage["assets_complete"] += 1
 
-        if (config.detail_dir / f"{key}.html").exists():
+        if (config.detail_dir / f"{safe_key_dirname(key)}.html").exists():
             stage["raw_detail_on_disk"] += 1
-        if (config.content_dir / f"{key}.html").exists():
+        if (config.content_dir / f"{safe_key_dirname(key)}.html").exists():
             stage["raw_content_on_disk"] += 1
         original = config.item_dir(key) / "content.original.html"
         if original.exists():
@@ -97,7 +128,7 @@ def run_verify(config: Config, state: ArchiveState, *, log: Logger = _noop) -> d
             except OSError:
                 pass
 
-        if status in {"failed", "auth_error", "warning", "pending"} or not item.get("content_fetched_at"):
+        if status != "complete":
             problem_rows.append(
                 {
                     "key": key,
@@ -107,18 +138,22 @@ def run_verify(config: Config, state: ArchiveState, *, log: Logger = _noop) -> d
                     "attempts": item.get("attempts") or 0,
                     "warning": truncate(item.get("warning") or "", 120),
                     "last_error": truncate(item.get("last_error") or "", 160),
-                    "detail_url": record.get("detail_url") or "",
+                    "detail_url": redact_url(record.get("detail_url") or ""),
                 }
             )
 
     # ---- 资源 ----
-    assets = state.all_assets()
+    assets = [a for a in state.all_assets() if not index["run_id"] or a["key"] in set(index["seen_keys"])]
+    asset_valid = {a["id"]: validate_downloaded_asset(config, a)["ok"] for a in assets}
+    from .truth import resource_state
+    legacy_count = sum(resource_state(config, a)['state'] == 'legacy_unverified' for a in assets)
     asset_stats = {
+        'legacy_unverified': legacy_count,
         "discovered": len(assets),
         "downloadable": sum(1 for a in assets if a.get("downloadable")),
         "attempted": sum(1 for a in assets if a.get("download_attempted")),
-        "downloaded": sum(1 for a in assets if a.get("download_status") == "ok"),
-        "failed": sum(1 for a in assets if a.get("download_attempted") and a.get("download_status") != "ok"),
+        "downloaded": sum(1 for a in assets if asset_valid[a["id"]]),
+        "failed": sum(1 for a in assets if a.get("download_attempted") and not asset_valid[a["id"]] and resource_state(config, a)["state"] != "legacy_unverified"),
         "non_http": sum(1 for a in assets if not a.get("downloadable")),
     }
 
@@ -142,27 +177,33 @@ def run_verify(config: Config, state: ArchiveState, *, log: Logger = _noop) -> d
         "indexed": indexed,
         "unique_records": len(unique_keys),
         "index_missing_vs_api": missing_count,
-        "index_complete": (missing_count == 0) if missing_count is not None else None,
+        "index_complete": index["ok"],
+        "index_generation": index,
+        "historical_indexed": state.count_records(),
         "types": types,
         "statuses": statuses,
         "original_order": {
             "positions_recorded": len(positions),
             "gaps": position_gaps[:50],
             "gap_count": len(position_gaps),
-            "contiguous": len(position_gaps) == 0,
+            "contiguous": positions == list(range(indexed)),
         },
         "baidu_space_pages": {
             "total": page_total,
             **stage,
             **status_breakdown,
+            "stages": stage,
         },
         "assets": asset_stats,
         "duplicates": duplicates,
         "failures_logged": len(state.all_failures()),
         "problem_items": len(problem_rows),
+        "stored_file_integrity": audit_stored_files(config, state),
     }
 
+    summary['validation'] = validation_result(summary)
     write_json_atomic(config.reports_dir / "summary.json", summary)
+    write_json_atomic(config.reports_dir / "stored_file_integrity.json", summary["stored_file_integrity"])
     write_text_atomic(
         config.reports_dir / "failed_items.csv",
         _csv_text(
@@ -180,7 +221,7 @@ def run_verify(config: Config, state: ArchiveState, *, log: Logger = _noop) -> d
                 {
                     "article_key": asset["key"],
                     "article_title": truncate(record.get("title") or "", 60),
-                    "url": asset.get("resolved_url") or asset.get("original_url"),
+                    "url": redact_url(asset.get("resolved_url") or asset.get("original_url") or ""),
                     "domain": asset.get("domain") or "",
                     "element_type": asset.get("element_type"),
                     "kind": asset.get("kind"),
@@ -205,6 +246,7 @@ def run_verify(config: Config, state: ArchiveState, *, log: Logger = _noop) -> d
 
 def render_summary_md(summary: dict[str, Any]) -> str:
     pages = summary["baidu_space_pages"]
+    stages = pages.get("stages", pages)
     assets = summary["assets"]
     order = summary["original_order"]
     duplicates = summary["duplicates"]
@@ -246,11 +288,11 @@ def render_summary_md(summary: dict[str, Any]) -> str:
         "",
         "| 阶段 | 数量 |",
         "|---|---|",
-        f"| 详情页已抓 | {pages['detail_fetched']} |",
-        f"| 找到 iframe | {pages['iframe_found']} |",
-        f"| 正文页已抓 | {pages['content_fetched']} |",
-        f"| 已解析 | {pages['parsed']} |",
-        f"| 资源已完成 | {pages['assets_complete']} |",
+        f"| 详情页已抓 | {stages['detail_fetched']} |",
+        f"| 找到 iframe | {stages['iframe_found']} |",
+        f"| 正文页已抓 | {stages['content_fetched']} |",
+        f"| 已解析 | {stages['parsed']} |",
+        f"| 资源已完成 | {stages['assets_complete']} |",
         "",
         "当前状态分布（互斥，合计应等于总计）：",
         "",
@@ -270,6 +312,12 @@ def render_summary_md(summary: dict[str, Any]) -> str:
         f"- raw 正文页：{pages['raw_content_on_disk']} / {pages['total']}",
         f"- content.original.html：{pages['content_original_on_disk']} / {pages['total']}",
         f"- 正文为空：{pages['empty_content']}",
+        f"- 源站返回页面不存在：{pages['source_unavailable']}（原始响应与列表记录已保留）",
+        "",
+        "## 已保存文件与旧版本证据",
+        "",
+        "文件字节校验通过不代表归档完整；完整性以 validation.ok 为准。",
+        f"旧版本未补证资源：{assets.get('legacy_unverified', 0)}。文件可能仍存在；运行 verify --rebuild-legacy-evidence 从 raw 离线补证。",
         "",
         "## 资源",
         "",
@@ -287,6 +335,16 @@ def render_summary_md(summary: dict[str, Any]) -> str:
     ]
 
     problems = summary["problem_items"]
+    integrity = summary["stored_file_integrity"]
+    lines += [
+        "## 文件校验", "",
+        f"- 已保存文件校验通过：{integrity['checked_files']} 个文件（不表示归档完整）",
+        f"- 当前资源完整性：{tick(integrity['current_resource_integrity']['ok'])}",
+        f"- 保留历史资源完整性：{tick(integrity['historical_retained_resource_integrity']['ok'])}",
+        f"- 缺少历史摘要，暂不能验证：{integrity['unverified_files']} 个文件",
+        f"- 损坏、缺失或派生版本过期：{integrity['issue_count']} 项",
+        "- 明细见 `reports/stored_file_integrity.json`。", "",
+    ]
     if problems:
         lines += [
             f"## ⚠️ 需要关注的条目：{problems} 条",
@@ -294,7 +352,10 @@ def render_summary_md(summary: dict[str, Any]) -> str:
             "明细见 `reports/failed_items.csv`，可用 `baidu-archive retry-failed` 重试。",
             "",
         ]
-    else:
+    elif validation_result(summary)['ok']:
         lines += ["## ✅ 没有需要关注的条目", ""]
+    else:
+        lines += ["## ⚠️ 归档未通过完整性校验", "",
+                  "请检查上面的索引数量、原始顺序与文件校验结果。", ""]
 
     return "\n".join(lines)

@@ -7,19 +7,26 @@ from __future__ import annotations
 
 import argparse
 import sys
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 from . import __version__
 from .auth import AuthError, import_curl, load_credentials
 from .client import ArchiveClient, AuthExpired, FetchError
 from .config import LIST_URL_CANDIDATES, Config, load_config
-from .parsers import parse_content_html, parse_detail_html, parse_list_html, parse_list_json
+from .locking import ArchiveBusy, ArchiveLock
+from .selection import SelectionError, export_selection
+from .parsers import ListResponseError, parse_content_html, parse_detail_html, parse_list_html, parse_list_json
 from .pipeline import export_master_index, run_fetch, run_index, run_parse
 from .assets import run_assets
 from .export import run_export
-from .state import ArchiveState
-from .verify import run_verify
+from .state import ArchiveState, SchemaVersionError
+from .tasks import TaskStopped
+from .storage import IntegrityError, save_raw
+from .verify import run_verify, validation_result
+from .truth import article_truth, index_truth, validate_downloaded_asset
 from .utils import redact_url, truncate, utcnow_iso
 
 
@@ -51,13 +58,15 @@ def _open(args) -> tuple[Config, ArchiveState, Log]:
         config.concurrency = args.concurrency
     if getattr(args, "delay", None) is not None:
         config.delay = args.delay
+    if getattr(args, "page_limit", None) is not None:
+        config.page_limit = args.page_limit
     config.ensure_dirs()
     return config, ArchiveState(config.db_path), Log(config.logs_dir, getattr(args, "verbose", False))
 
 
-def _client(config: Config, log: Log, *, require_auth: bool = True) -> ArchiveClient:
+def _client(config: Config, log: Log, *, require_auth: bool = True, endpoint: str | None = None) -> ArchiveClient:
     credentials = load_credentials()
-    if require_auth and not credentials.present:
+    if require_auth and not credentials.available_for(endpoint or (config.list_url(0) if config.list_url_template else config.site_root + "/fav/list")):
         raise AuthError(
             "未找到凭证。请任选一种方式提供：\n"
             "  1) 在浏览器 DevTools → Network 中右键列表请求 → Copy as cURL，存成文件后运行：\n"
@@ -110,44 +119,48 @@ def cmd_doctor(args) -> int:
             print("\n请先提供凭证，见 README「提供 Cookie」一节。")
             return 1
 
+        diagnostic_dir = config.raw_dir / "diagnostics" / f"doctor-{uuid4().hex}"
         client = _client(config, log)
         try:
-            if config.list_url_template:
+            candidates = [config.list_url_template] if config.list_url_template else []
+            if args.probe or not candidates:
+                candidates.extend(c for c in LIST_URL_CANDIDATES if c not in candidates)
+            original_template = config.list_url_template
+            for number, candidate in enumerate(candidates):
+                config.list_url_template = candidate
                 url = config.list_url(0, config.page_limit)
-                result = client.probe(url)
-                print(f"\n探测已配置端点：HTTP {result.get('status')} json={result.get('looks_json')}")
-                if result.get("ok"):
-                    parsed = parse_list_json(client.get(url, expect="json").content)
-                    print(f"✅ totalCount = {parsed['total_count']}，本页 {parsed['current_count']} 条")
-                    state.set_meta("total_count", parsed["total_count"])
-                    return 0
-                print(f"   样本：{truncate(result.get('sample', ''), 120)}")
-
-            if args.probe or not config.list_url_template:
-                print("\n自动探测候选端点：")
-                for candidate in LIST_URL_CANDIDATES:
-                    url = candidate.format(start=0, limit=config.page_limit)
-                    result = client.probe(url)
-                    mark = "✅" if result.get("ok") else "  "
-                    print(f" {mark} HTTP {result.get('status','—')} {redact_url(candidate)}")
-                    if result.get("ok"):
-                        config.list_url_template = candidate
-                        state.set_meta("discovered_list_url", candidate)
-                        print("\n找到可用端点。请把它写进 config.json：")
-                        print(f'  {{"list_url_template": "{candidate}"}}')
-                        return 0
-                print(
-                    "\n❌ 候选端点均不可用。这是预期情况 —— 请用 import-curl 从真实请求捕获：\n"
-                    "   DevTools → Network → 滚动列表 → 右键那条返回 JSON 的请求 → Copy as cURL\n"
-                    "   存成文件后运行：baidu-archive import-curl <文件>"
-                )
-                return 1
-            return 0
+                print(f"\n探测：{redact_url(candidate)}")
+                try:
+                    response = client.get(url, expect="raw", max_retries=1)
+                    save_raw(diagnostic_dir / f"list-{number}.json", response.content,
+                             url=url, status_code=response.status_code, headers=response.headers,
+                             extra={"stage": "doctor"})
+                    parsed = parse_list_json(response.content)
+                    _validate_list_response(parsed)
+                except (FetchError, ListResponseError):
+                    print("   ❌ 未返回有效收藏列表；已收到的成功响应保存在 raw/diagnostics/。")
+                    continue
+                print(f"✅ totalCount = {parsed['total_count']}，本页 {parsed['current_count']} 条")
+                state.set_meta("total_count", parsed["total_count"])
+                if candidate != original_template:
+                    state.set_meta("discovered_list_url", candidate)
+                    print("找到可用端点。请把列表模板写进 config.json：")
+                    print(f'  {{"list_url_template": "{redact_url(candidate)}"}}')
+                return 0
+            print("\n❌ 未找到有效列表。请重新登录，或用 import-curl 导入真实列表请求。")
+            return 1
         finally:
             client.close()
     finally:
         state.close()
         log.close()
+
+
+def _validate_list_response(parsed: dict) -> None:
+    if parsed["status"] not in (0, "0"):
+        raise ListResponseError("列表接口返回非成功状态")
+    if parsed["total_count"] > 0 and not parsed["html"].strip():
+        raise ListResponseError("列表声明有收藏，但本页 HTML 为空")
 
 
 def cmd_dry_run(args) -> int:
@@ -156,10 +169,15 @@ def cmd_dry_run(args) -> int:
     try:
         client = _client(config, log)
         try:
+            diagnostic_dir = config.raw_dir / "diagnostics" / f"dry-run-{uuid4().hex}"
+            log("DRY", f"本次原始响应保存至 {diagnostic_dir}")
             log("DRY", "第 1 步：列表接口")
             url = config.list_url(0, config.page_limit)
-            response = client.get(url, expect="json")
+            response = client.get(url, expect="raw", max_retries=1)
+            save_raw(diagnostic_dir / "list.json", response.content, url=url,
+                     status_code=response.status_code, headers=response.headers, extra={"stage": "list"})
             parsed = parse_list_json(response.content)
+            _validate_list_response(parsed)
             log("DRY", f"✅ totalCount={parsed['total_count']} limit={parsed['limit']} 本页={parsed['current_count']}")
 
             log("DRY", "第 2 步：解析列表 HTML")
@@ -189,7 +207,9 @@ def cmd_dry_run(args) -> int:
             key = target["key"]
             log("DRY", f"第 3 步：详情页 key={key} {truncate(target.get('title') or '', 30)}")
             detail_url = target.get("detail_url") or config.detail_url(key, "page")
-            detail = client.get(detail_url, expect="html")
+            detail = client.get(detail_url, expect="raw", max_retries=1)
+            save_raw(diagnostic_dir / "detail.html", detail.content, url=detail_url,
+                     status_code=detail.status_code, headers=detail.headers, extra={"stage": "detail", "key": key})
             info = parse_detail_html(detail.text, base_url=detail_url)
             if not info.get("iframe_url"):
                 log("DRY", "❌ 详情页未找到 iframe")
@@ -197,7 +217,9 @@ def cmd_dry_run(args) -> int:
             log("DRY", f"✅ iframe: {redact_url(info['iframe_url'])}")
 
             log("DRY", "第 4 步：正文页")
-            content = client.get(info["iframe_url"], expect="html")
+            content = client.get(info["iframe_url"], expect="raw", max_retries=1)
+            save_raw(diagnostic_dir / "content.html", content.content, url=info["iframe_url"],
+                     status_code=content.status_code, headers=content.headers, extra={"stage": "content", "key": key})
             parsed_content = parse_content_html(content.text)
             log("DRY", f"✅ 标题={parsed_content['title']!r}")
             log("DRY", f"   正文长度={parsed_content['content_length']} 字符，"
@@ -210,8 +232,9 @@ def cmd_dry_run(args) -> int:
             images = [a for a in assets if a["kind"] == "image"]
             log("DRY", f"   资源 {len(assets)} 个（图片 {len(images)}）")
 
-            ok = bool(parsed_content["has_container"] and parsed_content["content_length"] > 0)
-            log("DRY", "✅ 全链路验证通过，可以运行 `baidu-archive all`" if ok
+            ok = bool(parsed_content["has_container"] and
+                      (parsed_content["content_length"] > 0 or parsed_content["has_media"]))
+            log("DRY", "✅ 全链路验证通过，下一步建议先建立 2 页索引、试抓 5 篇" if ok
                        else "⚠️ 链路通但正文为空 —— 请人工确认这篇文章本身是否有内容")
             return 0 if ok else 1
         finally:
@@ -223,13 +246,12 @@ def cmd_dry_run(args) -> int:
 
 def cmd_index(args) -> int:
     config, state, log = _open(args)
-    run_id = state.start_run("index")
     try:
         client = _client(config, log)
         try:
-            stats = run_index(config, state, client, log=log, force=args.force, max_pages=args.max_pages)
-            state.finish_run(run_id, stats)
-            return 0
+            with state.tracked_run("index") as stats:
+                stats.update(run_index(config, state, client, log=log, force=args.force, max_pages=args.max_pages))
+            return 1 if stats.get("failed") else 0
         finally:
             client.close()
     except AuthExpired as exc:
@@ -239,17 +261,17 @@ def cmd_index(args) -> int:
         state.close()
         log.close()
 
-
 def cmd_fetch(args) -> int:
     config, state, log = _open(args)
-    run_id = state.start_run("fetch")
     try:
-        client = _client(config, log)
+        records = state.iter_records("page")
+        key = args.key[0] if args.key else records[0]["key"] if records else "preflight"
+        client = _client(config, log, endpoint=config.detail_url(key))
         try:
-            stats = run_fetch(config, state, client, log=log, force=args.force, limit=args.limit,
-                              only_keys=args.key or None)
-            state.finish_run(run_id, stats)
-            return 3 if stats.get("aborted") else 0
+            with state.tracked_run("fetch") as stats:
+                stats.update(run_fetch(config, state, client, log=log, force=args.force, limit=args.limit,
+                                  only_keys=args.key or None))
+            return 3 if stats.get("aborted") else (1 if stats.get("failed") or stats.get("incomplete_items") else 0)
         finally:
             client.close()
     finally:
@@ -257,35 +279,33 @@ def cmd_fetch(args) -> int:
         state.close()
         log.close()
 
-
 def cmd_parse(args) -> int:
     config, state, log = _open(args)
-    run_id = state.start_run("parse")
     try:
-        stats = run_parse(config, state, log=log, force=args.force, limit=args.limit)
-        state.finish_run(run_id, stats)
+        with state.tracked_run("parse") as stats:
+            stats.update(run_parse(config, state, log=log, force=args.force, limit=args.limit,
+                              only_keys=getattr(args, "key", None)))
         return 0
     finally:
         state.close()
         log.close()
 
-
 def cmd_assets(args) -> int:
     config, state, log = _open(args)
-    run_id = state.start_run("assets")
     try:
-        client = _client(config, log)
+        # Resource URLs use their own scoped credentials; public/signed CDN assets
+        # do not require a cookie for an unrelated favorites endpoint.
+        client = _client(config, log, require_auth=False)
         try:
-            stats = run_assets(config, state, client, log=log, force=args.force, limit=args.limit,
-                               include_media=args.include_media)
-            state.finish_run(run_id, stats)
-            return 3 if stats.get("aborted") else 0
+            with state.tracked_run("assets") as stats:
+                stats.update(run_assets(config, state, client, log=log, force=args.force, limit=args.limit,
+                                   include_media=args.include_media, only_keys=getattr(args, "key", None)))
+            return 3 if stats.get("aborted") else (1 if stats.get("failed") or stats.get("incomplete_items") else 0)
         finally:
             client.close()
     finally:
         state.close()
         log.close()
-
 
 def cmd_export(args) -> int:
     config, state, log = _open(args)
@@ -303,21 +323,44 @@ def cmd_export(args) -> int:
 def cmd_verify(args) -> int:
     config, state, log = _open(args)
     try:
+        if getattr(args, "rebuild_legacy_evidence", False):
+            from .legacy import rebuild_legacy_evidence
+            result = rebuild_legacy_evidence(config, state)
+            print(f"离线补证：{result}")
         summary = run_verify(config, state, log=log)
         print()
         print((config.reports_dir / "summary.md").read_text(encoding="utf-8"))
-        complete = summary.get("index_complete")
-        pages = summary["baidu_space_pages"]
-        return 0 if (complete is not False and pages["failed"] == 0) else 1
+        return 0 if validation_result(summary)['ok'] else 1
     finally:
         state.close()
         log.close()
 
 
+def cmd_export_selection(args) -> int:
+    config, state, log = _open(args)
+    try:
+        result = export_selection(config, state, keys=args.key, formats=args.format or ["md", "txt"],
+                                  output=Path(args.output) if args.output else None)
+        log("EXPORT", f"已导出 {result['count']} 篇 → {result['path']}")
+        log("EXPORT", f"ZIP SHA-256：{result['sha256']}")
+        return 0
+    finally:
+        state.close()
+        log.close()
+
+
+def cmd_serve(args) -> int:
+    from .server import serve
+
+    config = load_config(root=args.root, config_file=args.config)
+    serve(config, port=args.port, config_file=Path(args.config) if args.config else None)
+    return 0
+
+
 def cmd_retry_failed(args) -> int:
     config, state, log = _open(args)
     try:
-        targets = state.items_by_status(["failed", "auth_error", "pending", "warning"])
+        targets = state.items_by_status(["failed", "auth_error", "pending", "warning", "assets_partial"])
         if not targets:
             log("RETRY", "没有需要重试的条目")
             return 0
@@ -326,10 +369,15 @@ def cmd_retry_failed(args) -> int:
         client = _client(config, log)
         try:
             client.reset_auth_streak()
-            stats = run_fetch(config, state, client, log=log, force=True, only_keys=keys)
-            run_parse(config, state, log=log, force=True)
-            run_assets(config, state, client, log=log, force=False)
-            return 3 if stats.get("aborted") else 0
+            fetch_keys = [t["key"] for t in targets if t["status"] != "assets_partial"]
+            stats = run_fetch(config, state, client, log=log, force=True, only_keys=fetch_keys) if fetch_keys else {}
+            if stats.get("aborted"):
+                return 3
+            run_parse(config, state, log=log, force=False, only_keys=keys)
+            assets = run_assets(config, state, client, log=log, force=False, only_keys=keys)
+            if assets.get("aborted"):
+                return 3
+            return 1 if stats.get("failed") or assets.get("failed") else 0
         finally:
             client.close()
     finally:
@@ -340,36 +388,68 @@ def cmd_retry_failed(args) -> int:
 def cmd_status(args) -> int:
     config, state, log = _open(args)
     try:
-        total = state.get_meta("total_count")
+        index = index_truth(state)
+        total = index["expected"]
         print(f"归档目录：{config.root.resolve()}")
         print(f"API totalCount：{total}")
-        print(f"已索引：{state.count_records()}")
+        print(f"本轮已索引：{index['indexed']}，历史保留：{state.count_records()}，索引完整：{index['ok']}")
         print(f"类型：{state.type_counts()}")
-        print(f"状态：{state.status_counts()}")
-        print(f"资源：{state.asset_counts()}")
+        from collections import Counter
+        statuses = Counter(article_truth(config, state, r['key'])['status'] for r in state.iter_records())
+        assets = state.all_assets()
+        print(f"状态：{dict(statuses)}")
+        print(f"资源：实际验证成功 {sum(validate_downloaded_asset(config, a)['ok'] for a in assets)} / {len(assets)}")
+        from .truth import resource_state
+        legacy = [resource_state(config, a) for a in assets if resource_state(config, a)["state"] == "legacy_unverified"]
+        if legacy:
+            print(f"旧版本资源未补证：{len(legacy)}（其中 {sum(a['saved'] for a in legacy)} 个文件仍可校验）。运行 verify --rebuild-legacy-evidence 离线补证；缺少索引证据时还需重新读取列表。")
         failures = state.all_failures()
         print(f"失败记录：{len(failures)}")
         for failure in failures[:10]:
             print(f"  - key={failure['key']} {failure['stage']}: {truncate(failure['error'] or '', 80)}")
+        runs = state.recent_runs(1)
+        if runs:
+            latest = runs[0]
+            print(f"最近任务：{latest['command']} / {latest['stats'].get('outcome') or ('finished' if latest['finished_at'] else 'running_or_interrupted')}")
         return 0
     finally:
         state.close()
         log.close()
 
 
+def cmd_gui(args) -> int:
+    """打开原生窗口界面。"""
+    try:
+        from .gui import launch
+    except ImportError:
+        print(
+            "缺少 pywebview。安装后再试：\n"
+            "  .venv/bin/python -m pip install pywebview",
+            file=sys.stderr,
+        )
+        return 2
+    config = load_config(root=args.root, config_file=args.config)
+    config.ensure_dirs()
+    launch(config, debug=args.debug)
+    return 0
+
+
 def cmd_all(args) -> int:
+    result = 0
     for step, func in (
         ("index", cmd_index), ("fetch", cmd_fetch), ("parse", cmd_parse),
         ("assets", cmd_assets), ("export", cmd_export), ("verify", cmd_verify),
     ):
         print(f"\n{'='*64}\n  {step.upper()}\n{'='*64}")
         code = func(args)
+        if code:
+            result = code
         if code == 3:
             print(f"\n❌ 在 {step} 阶段因认证失效中止。换新 Cookie 后重新运行即可续传。")
             return 3
         if code != 0 and step in {"index", "fetch"}:
             print(f"\n⚠️ {step} 阶段返回 {code}，继续后续阶段（已抓到的数据不受影响）。")
-    return 0
+    return result
 
 
 # ==========================================================================
@@ -383,6 +463,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=None, help="配置文件（默认 config.json）")
     parser.add_argument("--concurrency", type=int, default=None, help="并发数（默认 2）")
     parser.add_argument("--delay", type=float, default=None, help="请求最小间隔秒（默认 0.8）")
+    parser.add_argument("--page-limit", type=int, default=None, help="列表单次请求条数（已实测支持 100）")
     parser.add_argument("--verbose", action="store_true")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -413,11 +494,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = subparsers.add_parser("parse", help="从 raw/ 重建 metadata 与正文（离线，不发请求）")
     sub.add_argument("--force", action="store_true")
     sub.add_argument("--limit", type=int, default=None)
+    sub.add_argument("--key", action="append", default=None, help="只解析指定 key（可重复）")
     sub.set_defaults(func=cmd_parse)
 
     sub = subparsers.add_parser("assets", help="下载资源并生成 content.local.html")
     sub.add_argument("--force", action="store_true")
     sub.add_argument("--limit", type=int, default=None)
+    sub.add_argument("--key", action="append", default=None, help="只处理指定 key 的资源（可重复）")
     sub.add_argument("--include-media", action="store_true", default=None, help="同时下载视频/音频等")
     sub.set_defaults(func=cmd_assets)
 
@@ -427,13 +510,28 @@ def build_parser() -> argparse.ArgumentParser:
     sub.set_defaults(func=cmd_export)
 
     sub = subparsers.add_parser("verify", help="完整性校验与报告")
+    sub.add_argument("--rebuild-legacy-evidence", action="store_true", help="仅从已保存 raw 和资源离线补证；证据不足时保留 legacy_unverified")
     sub.set_defaults(func=cmd_verify)
+
+    sub = subparsers.add_parser("export-selection", help="离线导出所选文章与资源为独立 ZIP")
+    sub.add_argument("--key", action="append", required=True, help="本人索引中的 key（可重复）")
+    sub.add_argument("--format", action="append", choices=["md", "txt"])
+    sub.add_argument("--output", default=None, help="新 ZIP 文件路径（默认 archive/exports/）")
+    sub.set_defaults(func=cmd_export_selection)
 
     sub = subparsers.add_parser("retry-failed", help="只重试失败/警告/未完成的条目")
     sub.set_defaults(func=cmd_retry_failed)
 
     sub = subparsers.add_parser("status", help="当前进度速览")
     sub.set_defaults(func=cmd_status)
+
+    sub = subparsers.add_parser("serve", help="启动本地归档操作台")
+    sub.add_argument("--port", type=int, default=8765)
+    sub.set_defaults(func=cmd_serve)
+
+    sub = subparsers.add_parser("gui", help="打开原生窗口界面")
+    sub.add_argument("--debug", action="store_true", help="启用 WebView 开发者工具")
+    sub.set_defaults(func=cmd_gui)
 
     sub = subparsers.add_parser("all", help="index → fetch → parse → assets → export → verify")
     sub.add_argument("--force", action="store_true")
@@ -452,7 +550,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        return args.func(args)
+        guard = (nullcontext() if args.command in {"status", "import-curl", "serve"} else
+                 ArchiveLock(load_config(root=args.root, config_file=args.config).root))
+        with guard:
+            return args.func(args)
+    except ArchiveBusy as exc:
+        print(f"\n❌ {exc}", file=sys.stderr)
+        return 6
+    except SelectionError as exc:
+        print(f"\n❌ 导出选择有误：{exc}", file=sys.stderr)
+        return 1
     except AuthError as exc:
         print(f"\n❌ 凭证问题：\n{exc}", file=sys.stderr)
         return 2
@@ -462,7 +569,16 @@ def main(argv: list[str] | None = None) -> int:
     except FetchError as exc:
         print(f"\n❌ 请求失败：{exc}", file=sys.stderr)
         return 4
-    except KeyboardInterrupt:
+    except ListResponseError:
+        print("\n❌ 列表响应无效。请检查登录态与端点；原始响应可在 raw/ 中检查。", file=sys.stderr)
+        return 4
+    except SchemaVersionError as exc:
+        print(f"数据库版本不受支持：{exc}", file=sys.stderr)
+        return 5
+    except IntegrityError as exc:
+        print(f"\n❌ 本地归档校验失败：{exc}。请检查 verify 报告，原件不会被覆盖。", file=sys.stderr)
+        return 5
+    except (KeyboardInterrupt, TaskStopped):
         print("\n已中断。已成功归档的内容不受影响，重新运行同一命令即可续传。", file=sys.stderr)
         return 130
 

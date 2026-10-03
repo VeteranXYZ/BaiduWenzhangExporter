@@ -1,0 +1,4 @@
+# Netscape HTTP Cookie File
+# Ordinary comment
+#HttpOnly_.baidu.com	TRUE	/	TRUE	1900000000	BDUSS	FAKE_HTTPONLY_BDUSS
+.baidu.com	TRUE	/	TRUE	1900000000	STOKEN	FAKE_STOKEN

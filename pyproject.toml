@@ -14,6 +14,7 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "lxml>=5.0",
     "markdownify>=0.13",
+    "Pillow>=10",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +25,9 @@ baidu-archive = "baidu_archive.cli:main"
 
 [tool.setuptools]
 packages = ["baidu_archive"]
+
+[tool.setuptools.package-data]
+baidu_archive = ["web/*.css", "web/*.js", "dashboard/*.html", "dashboard/*.css", "dashboard/*.js", "dashboard/*.svg", "ui/*.html", "ui/*.css", "ui/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

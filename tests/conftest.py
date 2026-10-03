@@ -27,3 +27,12 @@ def content_page() -> str:
 @pytest.fixture
 def login_page() -> str:
     return _read("login_page.html")
+
+
+def seed_generation(state, keys, expected=None):
+    """Synthetic observed generation for unrelated test setup; RC tests use run_index."""
+    expected = len(keys) if expected is None else expected
+    complete = len(set(keys)) == len(keys) == expected
+    state.set_meta('index_generation', {'run_id': 'fixture', 'seen_keys': keys,
+        'declared_total': expected, 'pagination_complete': complete, 'complete': complete,
+        'status': 'completed' if complete else 'partial', 'errors': [] if complete else ['fixture_partial']})
