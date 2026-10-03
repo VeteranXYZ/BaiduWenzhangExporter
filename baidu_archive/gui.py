@@ -20,6 +20,7 @@ from webview.menu import Menu, MenuAction, MenuSeparator
 
 from .config import Config, load_config
 from .state import ArchiveState
+from .utils import utcnow_iso
 from .truth import article_truth, index_truth, validate_downloaded_asset, resource_state
 
 UI_DIR = Path(__file__).parent / "ui"
@@ -70,6 +71,26 @@ def _notify(title: str, message: str) -> None:
         subprocess.run(["osascript", "-e", script], check=False, capture_output=True)
     elif sys.platform.startswith("linux"):
         subprocess.run(["notify-send", title, message], check=False, capture_output=True)
+
+
+def _disk_usage(root: Path) -> int:
+    """归档目录的实际占用（文章、图片、原始响应、数据库）。只做 stat，不读内容，几千个文件也只需几十毫秒。"""
+    total = 0
+    stack = [str(root)]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
 
 
 def _offline_client(config: Config):
@@ -148,7 +169,8 @@ class Api:
     }
 
     def _empty(self) -> dict[str, Any]:
-        return {**self.EMPTY_STATS, "root": str(self.config.root.resolve())}
+        return {**self.EMPTY_STATS, "root": str(self.config.root.resolve()),
+                "ignored_settings": dict(self.config.ignored_settings)}
 
     def get_stats(self) -> dict[str, Any]:
         """首屏用的瞬时快照：只读数据库记账，不做任何磁盘校验。
@@ -164,10 +186,7 @@ class Api:
                 statuses = state.status_counts()
                 assets = state.asset_counts()
                 index = index_truth(state)
-                try:
-                    db_bytes = self.config.db_path.stat().st_size
-                except OSError:
-                    db_bytes = 0
+                db_bytes = _disk_usage(self.config.root)
                 return {
                     **self._empty(),
                     "has_db": True,
@@ -596,6 +615,56 @@ class Api:
         except Exception as exc:  # noqa: BLE001
             report["error"] = str(exc)[:200]
         return report
+
+    def prepare_archive(self) -> dict[str, Any]:
+        """打开软件时自动调用：旧版本留下的归档在这里悄悄迁移，用户不需要做任何事。
+
+        从零开始下载的归档不会走到迁移分支 —— 新流程在下载时就写好了全部校验记录。
+        只有用旧版本代码下载过的归档才需要补齐，补齐全程离线；动手前先备份数据库。
+        """
+        if not self.config.db_path.exists():
+            return {"state": "empty", "migrated": False}
+        if self._busy():
+            return {"state": "busy", "migrated": False}
+        report = self.health()
+        if not report.get("needs_offline_repair"):
+            return {"state": "ready", "migrated": False}
+
+        backup = self._backup_database("before-migration")
+        result = self.repair_offline()
+        if result.get("ok"):
+            try:
+                with ArchiveState(self.config.db_path) as state:
+                    state.set_meta("migrated_at", utcnow_iso())
+                    state.set_meta("migration_backup", str(backup) if backup else None)
+            except Exception:  # noqa: BLE001
+                pass
+        return {"state": "ready" if result.get("ok") else "error", "migrated": bool(result.get("ok")),
+                "backup": str(backup) if backup else None, "error": result.get("error"),
+                "after": result.get("after")}
+
+    def _backup_database(self, label: str) -> Path | None:
+        """用 SQLite 在线备份接口拷一份快照（WAL 模式下直接复制文件会漏掉未合并的写入）。"""
+        import sqlite3
+        from datetime import datetime
+
+        folder = self.config.root / "backups"
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / f"state-{label}-{datetime.now():%Y%m%d-%H%M%S}.db"
+        try:
+            source = sqlite3.connect(str(self.config.db_path))
+            try:
+                destination = sqlite3.connect(str(target))
+                try:
+                    source.backup(destination)
+                finally:
+                    destination.close()
+            finally:
+                source.close()
+            return target
+        except sqlite3.Error:
+            target.unlink(missing_ok=True)
+            return None
 
     def repair_offline(self) -> dict[str, Any]:
         """一键修复旧数据：全程离线，不发任何网络请求。

@@ -33,6 +33,13 @@ LIST_URL_CANDIDATES = (
 # 每次都会报 unexpected_limit。所以配置文件与环境变量里的 page_limit 一律忽略。
 BAIDU_PAGE_LIMIT = 30
 
+# 下载速度的安全边界。百度空间是个遗留服务，太快会被限流甚至影响账号；
+# 慢一点没有代价 —— 已下载的不会重复下载。配置文件里超出边界的值会被收回到边界内。
+SAFE_DELAY = 0.8          # 推荐的请求间隔（秒）
+MIN_DELAY = 0.5           # 允许的最小间隔
+SAFE_CONCURRENCY = 2      # 推荐的同时下载数
+MAX_CONCURRENCY = 3       # 允许的最大同时下载数
+
 DETAIL_URL_TEMPLATE = f"{SITE_ROOT}/page/view?key={{key}}"
 ARTICLE_URL_TEMPLATE = f"{SITE_ROOT}/article/view?key={{key}}"
 
@@ -53,8 +60,8 @@ class Config:
     ignored_settings: dict[str, str] = field(default_factory=dict)
 
     # 请求策略 —— 面对遗留系统，可靠性优先于速度。
-    concurrency: int = 2
-    delay: float = 0.8
+    concurrency: int = SAFE_CONCURRENCY
+    delay: float = SAFE_DELAY
     jitter: float = 0.6
     connect_timeout: float = 10.0
     read_timeout: float = 30.0
@@ -208,4 +215,20 @@ def load_config(root: str | os.PathLike[str] | None = None, config_file: str | o
             else:
                 setattr(cfg, name, _coerce(os.environ[env_name], current))
 
+    _clamp_speed(cfg)
     return cfg
+
+
+def _clamp_speed(cfg: Config) -> None:
+    """把下载速度收回安全边界。被收回的设置记录在 ignored_settings，供界面说明。"""
+    if not isinstance(cfg.concurrency, int) or cfg.concurrency < 1:
+        cfg.concurrency = SAFE_CONCURRENCY
+    elif cfg.concurrency > MAX_CONCURRENCY:
+        cfg.ignored_settings["concurrency"] = (
+            f"配置中的同时下载数 {cfg.concurrency} 过高，已按上限 {MAX_CONCURRENCY} 执行")
+        cfg.concurrency = MAX_CONCURRENCY
+    if not isinstance(cfg.delay, (int, float)) or cfg.delay < MIN_DELAY:
+        if isinstance(cfg.delay, (int, float)):
+            cfg.ignored_settings["delay"] = (
+                f"配置中的请求间隔 {cfg.delay} 秒过快，已按下限 {MIN_DELAY} 秒执行")
+        cfg.delay = max(MIN_DELAY, float(cfg.delay) if isinstance(cfg.delay, (int, float)) else SAFE_DELAY)

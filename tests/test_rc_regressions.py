@@ -822,3 +822,47 @@ def test_placeholder_at_download_time_is_kept_as_evidence(archive, monkeypatch):
     assert asset['download_status'] == 'failed' and 'placeholder' in asset['error']
     kept = list((cfg.raw_dir / 'asset_responses').rglob('*.bin'))
     assert kept and kept[0].read_bytes() == PNG
+
+
+def test_aggressive_speed_in_config_file_is_clamped(tmp_path, monkeypatch):
+    """回归：config.json 里被写入过 并发 4 / 间隔 0.25 秒。下载速度由软件负责，
+    配置文件里超出安全边界的值收回到边界内，并在界面上说明。"""
+    import json
+    from baidu_archive.config import MAX_CONCURRENCY, MIN_DELAY, load_config
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / 'config.json').write_text(json.dumps({'concurrency': 4, 'delay': 0.25}))
+    cfg = load_config()
+    assert cfg.concurrency == MAX_CONCURRENCY == 3
+    assert cfg.delay == MIN_DELAY == 0.5
+    assert 'concurrency' in cfg.ignored_settings and 'delay' in cfg.ignored_settings
+
+
+def test_default_speed_is_safe(tmp_path, monkeypatch):
+    from baidu_archive.config import load_config
+    monkeypatch.chdir(tmp_path)
+    cfg = load_config()
+    assert (cfg.concurrency, cfg.delay) == (2, 0.8) and not cfg.ignored_settings
+
+
+def test_prepare_archive_migrates_legacy_silently_with_backup(archive, monkeypatch):
+    """打开软件即自动迁移旧归档，用户不需要点任何「修复」；迁移前留数据库备份。"""
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    _legacy_archive(cfg, state)
+    api = gui.Api(cfg); monkeypatch.setattr(api, 'get_task', lambda: None)
+    result = api.prepare_archive()
+    assert result['migrated'] is True and result['state'] == 'ready'
+    assert result['after']['complete'] == 1
+    backup = Path(result['backup'])
+    assert backup.is_file() and backup.parent == cfg.root / 'backups'
+    import sqlite3
+    with sqlite3.connect(backup) as db:                     # 备份是可用的完整数据库
+        assert db.execute('select count(*) from records').fetchone()[0] == 1
+    # 第二次打开：已迁移，什么都不做
+    again = api.prepare_archive()
+    assert again == {'state': 'ready', 'migrated': False}
+
+
+def test_prepare_archive_on_fresh_install(tmp_path, monkeypatch):
+    gui = _gui(monkeypatch)
+    assert gui.Api(Config(root=tmp_path / 'nothing')).prepare_archive() == {'state': 'empty', 'migrated': False}

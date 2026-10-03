@@ -106,14 +106,17 @@ def test_loopback_host_origin_and_mutation_token_are_required(http):
 
 
 def test_settings_persist_and_reject_out_of_bounds(application):
-    result = application.save_settings({'concurrency': 4, 'delay': .25, 'page_limit': 100})
+    result = application.save_settings({'concurrency': 3, 'delay': 1.5, 'page_limit': 100})
     # 每页条数不再可调：百度固定 30，改成别的值会让索引永远无法核实
     assert result['page_limit'] == 30
     assert 'page_limit' not in json.loads(application.config_file.read_text())
-    assert json.loads(application.config_file.read_text())['delay'] == .25
-    with pytest.raises(server.InputError):
-        application.save_settings({'concurrency': 100, 'delay': 0, 'page_limit': -1})
-    assert application.config.concurrency == 4
+    assert json.loads(application.config_file.read_text())['delay'] == 1.5
+    # 超出安全边界（同时下载数 > 3、间隔 < 0.5 秒）一律拒绝，避免给遗留服务造成压力
+    for unsafe in ({'concurrency': 4, 'delay': 1.5}, {'concurrency': 2, 'delay': .25},
+                   {'concurrency': 100, 'delay': 0, 'page_limit': -1}):
+        with pytest.raises(server.InputError):
+            application.save_settings(unsafe)
+    assert application.config.concurrency == 3
 
 
 def test_only_selected_keys_reach_pipeline_and_stop_is_resumable(application, monkeypatch):

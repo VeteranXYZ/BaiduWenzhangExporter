@@ -32,7 +32,9 @@ from .truth import article_truth, index_truth, validate_downloaded_asset, valida
 
 WEB = Path(__file__).parent / 'dashboard'
 ACTIVE = {'running', 'stopping'}
-LABELS = {'index': '更新收藏列表', 'archive': '抓取文章', 'assets': '补齐图片',
+# sync 是面向用户的唯一主任务：读列表 → 下载正文 → 整理 → 下载图片，一次走完。
+# 其余种类保留给命令行、测试和「重新下载某几篇」这类局部操作。
+LABELS = {'sync': '下载全部', 'index': '更新收藏列表', 'archive': '抓取文章', 'assets': '补齐图片',
           'export': '导出所选文章', 'export_images': '导出文章图片',
           'verify': '校验归档', 'connection': '验证百度连接'}
 
@@ -130,7 +132,8 @@ class Application:
     def save_settings(self, data):
         values = {}
         # page_limit 不再可调：百度接口固定每页 30 条，改了只会让索引永远无法核实。
-        for name, low, high, kind in [('concurrency', 1, 8, int), ('delay', .1, 10, float)]:
+        from .config import MAX_CONCURRENCY, MIN_DELAY
+        for name, low, high, kind in [('concurrency', 1, MAX_CONCURRENCY, int), ('delay', MIN_DELAY, 10, float)]:
             value = data.get(name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high:
                 raise InputError(f'{name} 需在 {low}–{high} 范围内')
@@ -205,7 +208,9 @@ class Application:
                     args['keys'] = list(dict.fromkeys(keys))
                 keys = args["keys"]
                 endpoint = (self.config.list_url(0) if self.config.list_url_template else self.config.site_root + '/fav/list') if kind in {'connection', 'index'} else self.config.detail_url(keys[0]) if keys else self.config.site_root + '/fav/list'
-                if kind in {'connection', 'index', 'archive'} and not load_credentials().available_for(endpoint):
+                if kind == 'sync':
+                    endpoint = self.config.list_url(0)
+                if kind in {'connection', 'index', 'archive', 'sync'} and not load_credentials().available_for(endpoint):
                     raise InputError('请先连接百度账号')
                 self.control = TaskControl()
                 self.job = {'id': uuid4().hex, 'kind': kind, 'label': LABELS[kind], 'status': 'running',
@@ -263,7 +268,15 @@ class Application:
                         elif kind == 'index':
                             stats.update(stage('读取收藏列表', lambda: run_index(config, state, client, force=True, log=self.log)))
                             self.connection = {'state': 'connected', 'checked_at': utcnow_iso()}
-                        elif kind == 'archive':
+                        elif kind in {'archive', 'sync'}:
+                            if kind == 'sync':
+                                # 先读一遍最新收藏列表，再对全部空间文章续传。已完成的会被跳过。
+                                stats.update(stage('读取收藏列表', lambda: run_index(config, state, client, force=True, log=self.log)))
+                                self.connection = {'state': 'connected', 'checked_at': utcnow_iso()}
+                                keys = [r['key'] for r in state.iter_records('page')]
+                                args['keys'] = keys
+                                self.update(total=len(keys))
+
                             def fetch_selected():
                                 if args['force']:
                                     return run_fetch(config, state, client, only_keys=keys, force=True, log=self.log)
@@ -279,16 +292,16 @@ class Application:
                                         return part
                                     result['failed'] += part.get('failed', 0)
                                 return result
-                            fetch = stage('抓取正文', fetch_selected)
-                            parsed = stage('保存可读正文', lambda: run_parse(config, state, only_keys=keys, log=self.log, control=self.control))
+                            fetch = stage('下载文章', fetch_selected)
+                            parsed = stage('整理文章', lambda: run_parse(config, state, only_keys=keys, log=self.log, control=self.control))
                             stats['failed'] = fetch.get('failed', 0) + parsed.get('warning', 0) + parsed.get('missing_raw', 0)
-                            if args['images']:
+                            if args['images'] or kind == 'sync':
                                 assets = stage('下载图片', lambda: run_assets(config, state, client, only_keys=keys, log=self.log))
                                 stats['failed'] += assets.get('failed', 0)
                         elif kind == 'assets':
                             assets = stage('补齐图片', lambda: run_assets(config, state, client, only_keys=keys, log=self.log))
                             stats['failed'] = assets.get('failed', 0)
-                if kind in {'archive', 'assets'}:
+                if kind in {'archive', 'assets', 'sync'}:
                     stats['failed'] = max(stats.get('failed', 0), sum(
                         not article_truth(config, state, key)['complete'] for key in keys))
                 export_master_index(config, state)
