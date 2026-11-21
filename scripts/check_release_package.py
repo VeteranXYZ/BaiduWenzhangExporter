@@ -234,7 +234,7 @@ with ArchiveState(cfg.db_path) as state, ArchiveClient(cfg, Credentials()) as cl
         if result.returncode != 1:
             raise RuntimeError('Unverified empty generation must fail verify')
         if options.native_gui:
-            subprocess.run([str(python), '-I', '-c', NATIVE_GUI_SMOKE], check=True, cwd=root, timeout=60)
+            subprocess.run([str(python), '-I', '-c', NATIVE_GUI_SMOKE], check=True, cwd=root, timeout=100)
         subprocess.run([str(python), '-m', 'pip', 'check'], check=True, cwd=root)
         print('Wheel build / contents / isolated install / CLI smoke / resources: PASS')
 

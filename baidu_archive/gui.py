@@ -1027,7 +1027,8 @@ def launch(config: Config | None = None, *, debug: bool = False) -> None:
             address, root, server = super().start_server(*args, **kwargs)
             # pywebview starts serving on a background thread. WKWebView can
             # request the first page before that thread has bound the port.
-            deadline = monotonic() + 5
+            # macOS can also delay the hostname lookup between bind and listen.
+            deadline = monotonic() + 50
             while True:
                 try:
                     with socket.create_connection(('127.0.0.1', server.port), timeout=0.25):
@@ -1035,7 +1036,7 @@ def launch(config: Config | None = None, *, debug: bool = False) -> None:
                 except OSError as exc:
                     if monotonic() >= deadline:
                         raise RuntimeError('桌面界面的本地服务未能启动') from exc
-                    sleep(0.025)
+                    sleep(0.1)
 
     config = config or load_config()
     api = Api(config)
