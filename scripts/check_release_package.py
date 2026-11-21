@@ -20,6 +20,7 @@ REQUIRED = ('ui/index.html', 'ui/app.css', 'ui/app.js', 'ui/brand.css',
 NATIVE_GUI_SMOKE = '''
 import time
 from pathlib import Path
+from urllib.request import ProxyHandler, build_opener
 from baidu_archive import gui
 from baidu_archive.config import Config
 from baidu_archive.state import ArchiveState
@@ -38,7 +39,11 @@ def check_window():
     global passed
     window = gui.webview.windows[0]
     try:
-        assert window.events.loaded.wait(15), 'The native UI did not load'
+        assert window.events.shown.wait(15), 'The native window did not open'
+        address = gui.webview.http.global_server.address
+        with build_opener(ProxyHandler({})).open(address + 'index.html', timeout=5) as response:
+            assert response.status == 200, 'The desktop UI server did not respond'
+        assert window.events.loaded.wait(20), f'WKWebView did not load {address}; current URL: {window.get_current_url()}'
         for _ in range(60):
             if window.evaluate_js('Boolean(document.querySelector(".hero"))'):
                 break
@@ -229,7 +234,7 @@ with ArchiveState(cfg.db_path) as state, ArchiveClient(cfg, Credentials()) as cl
         if result.returncode != 1:
             raise RuntimeError('Unverified empty generation must fail verify')
         if options.native_gui:
-            subprocess.run([str(python), '-I', '-c', NATIVE_GUI_SMOKE], check=True, cwd=root, timeout=45)
+            subprocess.run([str(python), '-I', '-c', NATIVE_GUI_SMOKE], check=True, cwd=root, timeout=60)
         subprocess.run([str(python), '-m', 'pip', 'check'], check=True, cwd=root)
         print('Wheel build / contents / isolated install / CLI smoke / resources: PASS')
 

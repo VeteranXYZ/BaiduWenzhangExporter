@@ -1016,6 +1016,27 @@ def _build_menu(api: Api) -> list:
 
 def launch(config: Config | None = None, *, debug: bool = False) -> None:
     """打开原生窗口。"""
+    import socket
+    from time import monotonic, sleep
+
+    from webview.http import BottleServer
+
+    class DesktopServer(BottleServer):
+        @classmethod
+        def start_server(cls, *args, **kwargs):
+            address, root, server = super().start_server(*args, **kwargs)
+            # pywebview starts serving on a background thread. WKWebView can
+            # request the first page before that thread has bound the port.
+            deadline = monotonic() + 5
+            while True:
+                try:
+                    with socket.create_connection(('127.0.0.1', server.port), timeout=0.25):
+                        return address, root, server
+                except OSError as exc:
+                    if monotonic() >= deadline:
+                        raise RuntimeError('桌面界面的本地服务未能启动') from exc
+                    sleep(0.025)
+
     config = config or load_config()
     api = Api(config)
     prefs = _load_prefs()
@@ -1045,7 +1066,7 @@ def launch(config: Config | None = None, *, debug: bool = False) -> None:
     window.events.closing += remember_geometry
 
     icon_name = {"darwin": "icon.icns", "win32": "icon.ico"}.get(sys.platform, "icon.png")
-    webview.start(menu=_build_menu(api), debug=debug, icon=str(UI_DIR / icon_name))
+    webview.start(menu=_build_menu(api), debug=debug, icon=str(UI_DIR / icon_name), server=DesktopServer)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -135,6 +135,30 @@ def test_download_resumes_after_stop_without_refetching_saved_articles(fresh_app
     assert seen.count('/fav/list') == 3                                          # 只重读了列表
 
 
+def test_completed_job_waits_for_history_to_finish(fresh_app, monkeypatch):
+    finalizing = threading.Event()
+    allow_finish = threading.Event()
+    finish_run = server.ArchiveState.finish_run
+
+    def pause_history(state, run_id, stats):
+        finalizing.set()
+        assert allow_finish.wait(5)
+        finish_run(state, run_id, stats)
+
+    monkeypatch.setattr(server.ArchiveState, 'finish_run', pause_history)
+    fresh_app.start({'kind': 'sync'})
+    try:
+        assert finalizing.wait(10)
+        assert json.loads(fresh_app.job_path.read_bytes())['status'] == 'running'
+    finally:
+        allow_finish.set()
+        fresh_app.thread.join(10)
+
+    assert finish(fresh_app)['status'] == 'completed'
+    with server.ArchiveLock(fresh_app.config.root):
+        assert fresh_app.library()['history'][0]['outcome'] == 'completed'
+
+
 def test_sync_requires_login(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(server, 'load_credentials', lambda: Credentials())

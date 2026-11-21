@@ -8,6 +8,7 @@ import mimetypes
 import re
 import secrets
 import threading
+from contextlib import ExitStack
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -242,6 +243,8 @@ class Application:
         config = replace(self.config)
         kind, keys = args['kind'], args['keys']
         published = None
+        completion = ExitStack()
+        outcome = {'status': 'failed', 'message': '任务意外中止，已保存的内容仍可使用。'}
         try:
             with ArchiveState(config.db_path) as state, state.tracked_run('ui:' + kind) as stats:
                 def stage(label, action):
@@ -339,29 +342,32 @@ class Application:
                     message = '校验通过，归档完整。' if validation['ok'] else '校验未通过，请查看缺失数量与完整性检查。'
                 if kind == 'retry_images':
                     message = f"补回 {result['recovered']} 个图片引用，仍缺失 {result['failed']} 个，跳过 {result['skipped']} 个。"
-                # 停止与完成共用锁：已接收停止信号的任务不能再次标记 completed。
-                with self.lock:
-                    self.control.check()
-                    self.update(status=status, phase='已结束', finished_at=utcnow_iso(),
-                                done=len(args.get('asset_ids', keys)), message=message)
+                # Hold the stop lock through the history commit and archive unlock.
+                completion.enter_context(self.lock)
+                self.control.check()
         except (TaskStopped, KeyboardInterrupt):
-            self.update(status='stopped', message='任务已停止，已保存的内容保留。点击继续任务即可续传。')
+            outcome = dict(status='stopped', message='任务已停止，已保存的内容保留。点击继续任务即可续传。')
         except AuthExpired:
             self.connection = {'state': 'expired', 'checked_at': utcnow_iso()}
-            self.update(status='failed', message='百度登录已失效，请在连接账号中更新登录凭证。')
+            outcome = dict(status='failed', message='百度登录已失效，请在连接账号中更新登录凭证。')
         except (SelectionError, IntegrityError):
-            self.update(status='failed', message='导出未完成：没有可导出的图片，或本地文件缺失、校验不一致。请校验归档后重试。')
+            outcome = dict(status='failed', message='导出未完成：没有可导出的图片，或本地文件缺失、校验不一致。请校验归档后重试。')
         except Exception as exc:
             if kind == 'connection':
                 self.connection = {'state': 'error', 'checked_at': utcnow_iso()}
-            self.update(status='failed', message=f'任务未完成（{type(exc).__name__}），可检查连接后重试。')
+            outcome = dict(status='failed', message=f'任务未完成（{type(exc).__name__}），可检查连接后重试。')
+        else:
+            outcome = dict(status=status, phase='已结束', finished_at=utcnow_iso(),
+                           done=len(args.get('asset_ids', keys)), message=message)
         finally:
-            try:
-                if published and self.snapshot()['status'] not in {'completed', 'partial'}:
-                    published.unlink(missing_ok=True)
-                    self.update(download=None, result=None)
-            finally:
-                guard.__exit__()
+            with completion, self.lock:
+                try:
+                    if published and outcome['status'] not in {'completed', 'partial'}:
+                        published.unlink(missing_ok=True)
+                        outcome.update(download=None, result=None)
+                    self.update(**outcome)
+                finally:
+                    guard.__exit__()
 
     def stop(self):
         with self.lock:
