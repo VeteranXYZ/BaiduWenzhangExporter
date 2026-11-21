@@ -282,5 +282,6 @@ if __name__ == "__main__":
             write_set(key, target)
         print(contact_sheet(target / "contact-sheet.png"))
     else:
-        for kind, path in build_shipping_icons(Path("assets")).items():
+        icon_dir = Path(__file__).resolve().parents[1] / "baidu_archive" / "ui"
+        for kind, path in build_shipping_icons(icon_dir).items():
             print(f"{kind:5} {path}  ({path.stat().st_size / 1024:.0f} KB)")

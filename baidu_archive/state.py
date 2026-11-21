@@ -8,12 +8,15 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import tempfile
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+from uuid import uuid4
 
 from .utils import utcnow_iso
 
@@ -22,6 +25,44 @@ SCHEMA_VERSION = 1
 
 class SchemaVersionError(RuntimeError):
     """数据库由更新的程序创建，当前版本不能安全修改。"""
+
+
+def database_version(path: Path) -> int:
+    with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as database:
+        return database.execute('PRAGMA user_version').fetchone()[0]
+
+
+def backup_before_migration(path: Path) -> Path:
+    """Verify a standalone SQLite snapshot before replacing any archive state."""
+    folder = path.parent / 'backups'
+    temporary = None
+    try:
+        folder.mkdir(exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix='.state-', suffix='.partial', dir=folder)
+        temporary = Path(name)
+        os.close(fd)
+        with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as source:
+            with closing(sqlite3.connect(temporary)) as snapshot:
+                source.backup(snapshot)
+                snapshot.execute('PRAGMA journal_mode=DELETE')
+                if snapshot.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
+                    raise sqlite3.DatabaseError('备份完整性检查失败')
+        with temporary.open('rb') as handle:
+            os.fsync(handle.fileno())
+        target = folder / f'state-before-migration-{uuid4().hex}.db'
+        temporary.rename(target)
+        if os.name == 'posix':
+            directory = os.open(folder, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        return target
+    except (OSError, sqlite3.Error) as exc:
+        raise RuntimeError(f'无法备份归档数据库，已停止迁移：{exc}') from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 SCHEMA = """
@@ -154,11 +195,15 @@ class ArchiveState:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30.0)
         self._conn.row_factory = sqlite3.Row
+        self.schema_backup: Path | None = None
         try:
-            # Check before changing even journal settings on a future schema.
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version > SCHEMA_VERSION:
                 raise SchemaVersionError("数据库版本较新，请使用创建它的程序版本")
+            self._conn.execute("PRAGMA synchronous=FULL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            if version < SCHEMA_VERSION:
+                self._initialize_schema()
             # Journal mode transition itself may return BUSY immediately, even
             # with busy_timeout. Retry only lock contention within the same bound.
             deadline = time.monotonic() + 30.0
@@ -170,25 +215,27 @@ class ArchiveState:
                     if 'locked' not in str(exc).lower() or time.monotonic() >= deadline:
                         raise
                     time.sleep(0.05)
-            self._conn.execute("PRAGMA synchronous=FULL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            # SQLite, rather than an instance lock, serializes all connections/processes.
-            self._conn.execute("BEGIN IMMEDIATE")
-            version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-            if version > SCHEMA_VERSION:
-                raise SchemaVersionError("数据库版本较新，请升级程序")
-            if version < SCHEMA_VERSION:
-                # executescript commits an existing transaction. Execute DDL ourselves.
-                for statement in SCHEMA.split(';'):
-                    if statement.strip():
-                        self._conn.execute(statement)
-                self._migrate()
-                self._conn.execute("PRAGMA user_version=" + str(SCHEMA_VERSION))
-            self._conn.commit()
         except BaseException:
             self._conn.rollback()
             self._conn.close()
             raise
+
+    def _initialize_schema(self) -> None:
+        # Reserve the write transaction before snapshotting through a separate read connection.
+        self._conn.execute('BEGIN IMMEDIATE')
+        version = self._conn.execute('PRAGMA user_version').fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise SchemaVersionError('数据库版本较新，请升级程序')
+        if version < SCHEMA_VERSION:
+            if self._conn.execute('SELECT 1 FROM sqlite_master LIMIT 1').fetchone():
+                self.schema_backup = backup_before_migration(self.db_path)
+            # executescript commits the transaction before DDL, so execute each statement here.
+            for statement in SCHEMA.split(';'):
+                if statement.strip():
+                    self._conn.execute(statement)
+            self._migrate()
+            self._conn.execute('PRAGMA user_version=' + str(SCHEMA_VERSION))
+        self._conn.commit()
 
     # 归档工具不能因为加了一列就让已有 state.db 作废，故做幂等的补列迁移。
     _MIGRATIONS = (("records", "list_source", "TEXT"),
@@ -466,6 +513,21 @@ class ArchiveState:
             rows = self._conn.execute("SELECT * FROM assets WHERE active=1 ORDER BY key, id").fetchall()
         return [dict(r) for r in rows]
 
+    def get_asset(self, asset_id: int) -> dict[str, Any] | None:
+        """按主键读取当前资源，避免缩略图请求逐次扫描全库。"""
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM assets WHERE id=? AND active=1", (asset_id,)).fetchone()
+        return dict(row) if row else None
+
+    def backup_to(self, path: Path) -> None:
+        """Write a consistent database snapshot, including any committed WAL pages."""
+        with self._lock:
+            destination = sqlite3.connect(str(path))
+            try:
+                self._conn.backup(destination)
+            finally:
+                destination.close()
+
     def asset_counts(self) -> dict[str, int]:
         with self._lock:
             total = int(self._conn.execute("SELECT COUNT(*) AS n FROM assets WHERE active=1").fetchone()["n"])
@@ -542,7 +604,7 @@ class ArchiveState:
             stats.update(outcome="failed", error_type=type(exc).__name__)
             raise
         finally:
-            if stats.get('outcome') != 'completed':
+            if stats.get('outcome') not in {'completed', 'partial'}:
                 stats.pop('download', None)
             self.finish_run(run_id, stats)
 

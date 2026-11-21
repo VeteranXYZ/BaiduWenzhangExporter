@@ -317,9 +317,9 @@ def test_git_required_file_audit_rejects_missing_runtime():
     root=source.parents[1]
     # This also works in the already constructed clean release tree, without .git.
     manifest={str(p.relative_to(root)) for folder in ('baidu_archive','tests','scripts') for p in (root/folder).rglob('*') if p.is_file()}
-    manifest.update({'pyproject.toml','README.md','requirements.txt','requirements-dev.txt'})
+    manifest.update({'pyproject.toml','README.md','LICENSE','requirements.txt','requirements-dev.txt'})
     module.audit_required_files(root,manifest)
-    for name in ('baidu_archive/truth.py','baidu_archive/media.py'):
+    for name in ('baidu_archive/truth.py', 'baidu_archive/media.py', 'LICENSE'):
         with pytest.raises(RuntimeError,match=name): module.audit_required_files(root,manifest-{name})
 
 

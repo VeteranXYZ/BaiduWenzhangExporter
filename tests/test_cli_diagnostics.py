@@ -5,7 +5,7 @@ import pytest
 from baidu_archive import cli
 from baidu_archive.auth import Credentials
 from baidu_archive.client import Response
-from baidu_archive.config import Config
+from baidu_archive.config import Config, load_config
 
 
 @pytest.fixture
@@ -43,10 +43,30 @@ def test_doctor_probe_formats_timestamp_and_saves_one_response(diagnostic_env, m
     assert len(files) == 1 and files[0].read_text() == list_response
 
 
-def test_page_limit_override_reaches_list_request(diagnostic_env, monkeypatch, list_response):
+def test_cli_uses_fixed_page_size_even_with_legacy_override(diagnostic_env, monkeypatch, list_response, capsys):
+    monkeypatch.setattr(cli, 'load_config', load_config)
     calls = install_responses(monkeypatch, list_response)
     assert cli.main(["--page-limit", "100", "doctor", "--probe"]) == 0
-    assert "limit=100" in calls[0]
+    assert "limit=30" in calls[0]
+    assert "固定每页 30 条" in capsys.readouterr().err
+
+
+def test_cli_speed_overrides_respect_limits_after_precedence(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / 'config.json').write_text('{"concurrency": 2, "delay": 2, "page_limit": 100}')
+    monkeypatch.setenv('BAIDU_ARCHIVE_DELAY', '1.25')
+    parser = cli.build_parser()
+
+    speed = cli._command_config(parser.parse_args(['--concurrency', '6', '--delay', '0.1', 'status']))
+    assert (speed.concurrency, speed.delay, speed.page_limit) == (3, 0.5, 30)
+    assert set(speed.ignored_settings) == {'concurrency', 'delay', 'page_limit'}
+
+    normal = cli._command_config(parser.parse_args(['--concurrency', '1', '--page-limit', '30', 'gui']))
+    assert (normal.concurrency, normal.delay, normal.page_limit) == (1, 1.25, 30)
+    assert not normal.ignored_settings
+
+    invalid = cli._command_config(parser.parse_args(['--concurrency', '0', '--delay', 'nan', 'serve']))
+    assert (invalid.concurrency, invalid.delay) == (2, 0.8)
 
 
 def test_doctor_invalid_json_is_failure_without_response_in_log(diagnostic_env, monkeypatch, capsys):

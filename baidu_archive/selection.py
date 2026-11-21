@@ -11,15 +11,53 @@ from uuid import uuid4
 
 from .config import Config
 from .export import html_to_markdown, html_to_text
+from .safe_files import read_resource
 from .state import ArchiveState
 from .storage import IntegrityError, current_content_path, read_json
 from .utils import safe_key_dirname, sha256_bytes, sha256_file, utcnow_iso
 from .tasks import TaskControl
-from .truth import validate_downloaded_asset
+from .truth import missing_resource, validate_downloaded_asset, validated_reading_content
 
 
 class SelectionError(ValueError):
     pass
+
+
+def export_preservation(config: Config, state: ArchiveState, output: Path) -> dict:
+    """Keep the private archive evidence and database in a restorable ZIP."""
+    files = []
+    with tempfile.TemporaryDirectory(prefix='.state-snapshot-', dir=output.parent) as temporary:
+        snapshot = Path(temporary) / 'state.db'
+        state.backup_to(snapshot)
+        with zipfile.ZipFile(output, 'x', zipfile.ZIP_DEFLATED) as bundle:
+            def include(name: str, body: bytes) -> None:
+                bundle.writestr(name, body)
+                files.append({'path': name, 'bytes': len(body), 'sha256': sha256_bytes(body)})
+
+            include('state.db', snapshot.read_bytes())
+            for root in (config.raw_dir, config.items_dir):
+                for current, dirs, names in os.walk(root):
+                    folder = Path(current)
+                    # Diagnostic runs aren't part of the archive and may include login responses.
+                    if folder == config.raw_dir and 'diagnostics' in dirs:
+                        dirs.remove('diagnostics')
+                    if any((folder / name).is_symlink() for name in dirs):
+                        raise IntegrityError('原始档案存在未验证的目录链接')
+                    dirs.sort()
+                    for name in sorted(names):
+                        path = (folder / name).relative_to(config.root)
+                        body, _ = read_resource(config.root, path)
+                        include(path.as_posix(), body)
+            bundle.writestr('manifest.json', json.dumps({'schema_version': 1, 'files': files},
+                                                       ensure_ascii=False, indent=2) + '\n')
+    return {'files': len(files), 'sha256': sha256_file(output)}
+
+
+def _export_asset(config: Config, asset: dict) -> tuple[dict | None, dict | None]:
+    result = validate_downloaded_asset(config, asset)
+    if result['ok']:
+        return result, None
+    return None, missing_resource(asset, result)
 
 
 def _publish_zip(temporary: str, target: Path, control: TaskControl) -> str:
@@ -78,12 +116,10 @@ def export_images(config: Config, state: ArchiveState, *, keys: list[str],
                     if asset['kind'] != 'image':
                         continue
                     references += 1
-                    if asset.get('download_status') != 'ok' or not asset.get('local_path'):
-                        missing.append({'reference': references, 'status': 'not_downloaded'})
+                    validation, issue = _export_asset(config, asset)
+                    if issue:
+                        missing.append({'reference': references, **issue})
                         continue
-                    validation = validate_downloaded_asset(config, asset)
-                    if not validation['ok']:
-                        raise IntegrityError('图片缺失、身份或校验不一致：' + validation['reason'])
                     relative = Path(asset['local_path'])
                     body = validation['body']
                     digest = sha256_bytes(body)
@@ -136,23 +172,48 @@ def export_selection(config: Config, state: ArchiveState, *, keys: list[str],
         raise SelectionError("选择包含不在本人索引中的 key")
     if any(record["type"] != "page" for record in records):
         raise SelectionError("选择包含尚未归档正文的其他收藏")
+    from .site import offline_reading_html
+
     files = {}
     entries = []
+    missing_total = 0
+    portable_media = 'md' in formats
     for record in records:
         control.check()
         key = record["key"]
         item_dir = config.item_dir(key)
-        source = current_content_path(item_dir)
+        source = current_content_path(item_dir, prefer_local=False)
         if not source.is_file():
             raise SelectionError(f"文章尚未保存正文：{key}")
         metadata = read_json(item_dir / "metadata.json")
         if not isinstance(metadata, dict):
             raise SelectionError(f"文章缺少有效元数据：{key}")
-        content = source.read_text(encoding="utf-8")
+        available_media, missing, origin_by_path = {}, [], {}
+        for asset in state.assets_for(key):
+            control.check()
+            if asset['kind'] == 'link' or asset.get('scheme_kind') == 'data':
+                continue
+            if not portable_media:
+                result = validate_downloaded_asset(config, asset)
+                if not result['ok']:
+                    missing.append(missing_resource(asset, result))
+                continue
+            validation, issue = _export_asset(config, asset)
+            if issue:
+                missing.append(issue)
+            else:
+                available_media[asset['local_path']] = validation['body']
+            if asset.get('local_path'):
+                origin_by_path[asset['local_path']] = asset.get('resolved_url') or asset['original_url']
+        content = validated_reading_content(config, state, key)
+        base = metadata.get('iframe_url_original') or metadata.get('detail_url')
+        offline = offline_reading_html(content, available_media, base_url=base, origin_by_path=origin_by_path)
         prefix = f"articles/{safe_key_dirname(key)}/"
         for fmt in dict.fromkeys(formats):
             control.check()
-            text = html_to_markdown(content) if fmt == "md" else html_to_text(content)
+            text = html_to_markdown(offline) if fmt == "md" else html_to_text(content)
+            if not text:
+                text = '［此篇正文没有可提取的文字。媒体和原始地址请查阅归档及缺失清单。］'
             files[prefix + "content." + fmt] = (text + "\n").encode("utf-8")
         exported_metadata = {name: metadata.get(name) for name in (
             "key", "title", "list_title", "content_title", "list_date", "content_date",
@@ -160,23 +221,14 @@ def export_selection(config: Config, state: ArchiveState, *, keys: list[str],
             "global_position", "content_sha256", "parsed_sha256", "warnings",
         )}
         files[prefix + "metadata.json"] = (json.dumps(exported_metadata, ensure_ascii=False, indent=2) + "\n").encode()
-        # Markdown 的 assets/ 相对引用在 ZIP 内仍成立；不打包任何会话文件或签名元数据。
-        if "md" in formats:
-            for asset in state.assets_for(key):
-                control.check()
-                if asset.get("download_status") != "ok" or not asset.get("local_path"):
-                    continue
-                relative = Path(asset["local_path"])
-                validation = validate_downloaded_asset(config, asset)
-                if not validation['ok']:
-                    raise IntegrityError('导出所需资源缺失、身份或校验不一致：' + validation['reason'])
-                body = validation['body']
-                files[prefix + relative.as_posix()] = body
+        for relative, body in available_media.items():
+            files[prefix + relative] = body
+        missing_total += len(missing)
         entries.append({"key": key, "title": metadata.get("title"), "directory": prefix,
-                        "global_position": record.get("global_position")})
+                        "global_position": record.get("global_position"), "missing_resources": missing})
 
     manifest = {"schema_version": 1, "generated_at": utcnow_iso(), "count": len(entries),
-                "formats": list(dict.fromkeys(formats)), "entries": entries,
+                "formats": list(dict.fromkeys(formats)), "entries": entries, "missing_resources": missing_total,
                 "files": [{"path": name, "bytes": len(body), "sha256": sha256_bytes(body)}
                           for name, body in files.items()]}
     files["manifest.json"] = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode()
@@ -197,7 +249,8 @@ def export_selection(config: Config, state: ArchiveState, *, keys: list[str],
         digest = _publish_zip(temporary, target, control)
         published = True
         control.check()
-        return {"path": str(target), "count": len(entries), "files": len(files), "sha256": digest}
+        return {"path": str(target), "count": len(entries), "files": len(files),
+                "missing_resources": missing_total, "sha256": digest}
     except BaseException:
         if published:
             target.unlink(missing_ok=True)

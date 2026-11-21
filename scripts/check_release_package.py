@@ -1,8 +1,9 @@
 """Build, inspect and install the wheel without using the source checkout at runtime."""
 from __future__ import annotations
 
-import json
+import argparse
 import ast
+import json
 import shutil
 import subprocess
 import sys
@@ -11,9 +12,53 @@ import venv
 from pathlib import Path
 from zipfile import ZipFile
 
-REQUIRED = ('ui/index.html', 'ui/app.css', 'ui/app.js', 'dashboard/index.html',
-            'dashboard/dashboard.css', 'dashboard/dashboard.js', 'dashboard/logo.svg',
+REQUIRED = ('ui/index.html', 'ui/app.css', 'ui/app.js', 'ui/brand.css',
+            'ui/icon.png', 'ui/icon.ico', 'ui/icon.icns', 'dashboard/index.html',
+            'dashboard/dashboard.css', 'dashboard/dashboard.js',
             'web/style.css', 'web/app.js')
+
+NATIVE_GUI_SMOKE = '''
+import time
+from pathlib import Path
+from baidu_archive import gui
+from baidu_archive.config import Config
+from baidu_archive.state import ArchiveState
+
+config = Config(root=Path.cwd() / 'smoke-archive')
+with ArchiveState(config.db_path) as state:
+    state.upsert_record({'key': 'bookmark', 'type': 'other', 'title': 'Package bookmark',
+                         'external_url': 'https://example.test/bookmark'})
+
+gui._load_prefs = lambda: {}
+gui._update_prefs = lambda **changes: None
+start = gui.webview.start
+passed = False
+
+def check_window():
+    global passed
+    window = gui.webview.windows[0]
+    try:
+        assert window.events.loaded.wait(15), 'The native UI did not load'
+        for _ in range(60):
+            if window.evaluate_js('Boolean(document.querySelector(".hero"))'):
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError('The desktop bridge did not load the archive')
+        assert window.evaluate_js('getComputedStyle(document.querySelector(".hero")).paddingTop') != '0px'
+        window.evaluate_js('document.querySelector(\\'[data-page="archives"]\\').click()')
+        assert window.evaluate_js('document.querySelector("#articleResults").textContent').find('Package smoke') >= 0
+        window.evaluate_js('document.querySelector(\\'[data-filter="external"]\\').click()')
+        assert window.evaluate_js('document.querySelector("[data-bookmark]").dataset.bookmark') == 'bookmark'
+        passed = True
+    finally:
+        window.destroy()
+
+gui.webview.start = lambda **kwargs: start(check_window, **kwargs)
+gui.launch(config)
+assert passed, 'Native desktop checks did not finish'
+print('Installed macOS desktop window, stylesheet, bridge and bookmark navigation: PASS')
+'''
 
 
 def tracked_manifest(repo: Path) -> set[str]:
@@ -22,7 +67,7 @@ def tracked_manifest(repo: Path) -> set[str]:
 
 
 def audit_required_files(repo: Path, manifest: set[str]) -> None:
-    required = {'pyproject.toml', 'README.md', 'requirements-dev.txt', 'requirements.txt',
+    required = {'pyproject.toml', 'README.md', 'LICENSE', 'requirements-dev.txt', 'requirements.txt',
                 'baidu_archive/truth.py', 'baidu_archive/media.py', 'baidu_archive/safe_files.py',
                 'baidu_archive/legacy.py', 'tests/fixtures/tiny.png', 'tests/fixtures/tiny.mp4',
                 'tests/fixtures/tiny.wav'}
@@ -55,6 +100,11 @@ def copy_tracked_tree(repo: Path, project: Path, manifest: set[str]) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--native-gui', action='store_true', help='also open and check the installed macOS desktop app')
+    options = parser.parse_args()
+    if options.native_gui and sys.platform != 'darwin':
+        parser.error('--native-gui requires a macOS desktop session')
     repo = Path(__file__).resolve().parents[1]
     manifest = tracked_manifest(repo)
     audit_required_files(repo, manifest)
@@ -72,13 +122,23 @@ def main() -> None:
             missing += [name for name in manifest if name.startswith('baidu_archive/') and name.endswith('.py') and name not in bundle.namelist()]
             if missing:
                 raise RuntimeError('Wheel missing resources: ' + ', '.join(missing))
+            license_entries = [name for name in bundle.namelist() if name.split('/', 1)[0].endswith('.dist-info')
+                               and Path(name).name == 'LICENSE']
+            if not any(bundle.read(name) == (project / 'LICENSE').read_bytes() for name in license_entries):
+                raise RuntimeError('Wheel missing the project LICENSE')
         environment = root / 'installed-env'
         venv.EnvBuilder(with_pip=True).create(environment)
         python = environment / ('Scripts/python.exe' if sys.platform == 'win32' else 'bin/python')
-        subprocess.run([str(python), '-m', 'pip', 'install', '--no-cache-dir', str(wheel)], check=True, cwd=root)
+        wheel_requirement = str(wheel) + ('[gui]' if options.native_gui else '')
+        subprocess.run([str(python), '-m', 'pip', 'install', '--no-cache-dir', wheel_requirement], check=True, cwd=root)
         subprocess.run([str(python), '-m', 'pip', 'install', '--no-cache-dir', 'pytest>=8'], check=True, cwd=root)
-        # Tests import the installed wheel, from the clean manifest test directory.
-        subprocess.run([str(python), '-m', 'pytest', '-p', 'no:cacheprovider',
+        # Preload the installed package before pytest adds discovery paths.
+        run_installed_tests = '''
+import pathlib, sys, pytest, baidu_archive
+assert 'site-packages' in pathlib.Path(baidu_archive.__file__).parts, baidu_archive.__file__
+raise SystemExit(pytest.main(sys.argv[1:]))
+'''
+        subprocess.run([str(python), '-I', '-c', run_installed_tests, '-p', 'no:cacheprovider',
                         '--basetemp=' + str(root / 'test-output')], check=True, cwd=project)
         node = shutil.which('node')
         if not node:
@@ -111,7 +171,7 @@ service = LocalServer(('127.0.0.1', 0), app)
 thread = threading.Thread(target=service.serve_forever)
 thread.start()
 try:
-    for path in ('/', '/dashboard.css', '/dashboard.js', '/logo.svg',
+    for path in ('/', '/dashboard.css', '/dashboard.js', '/brand.css', '/icon.png',
                  '/api/bootstrap', '/api/library', '/api/job'):
         with urllib.request.urlopen('http://127.0.0.1:' + str(service.server_port) + path) as response:
             assert response.status == 200, path
@@ -119,7 +179,7 @@ try:
 finally:
     service.shutdown(); service.server_close(); thread.join(5)
     assert not thread.is_alive()
-print('Installed Server startup and 7 HTTP endpoints PASS; process stopped')
+print('Installed Server startup and 8 HTTP endpoints PASS; process stopped')
 # A real installed pipeline fixture; only its HTTP transport is synthetic.
 import httpx
 from baidu_archive.state import ArchiveState
@@ -168,6 +228,8 @@ with ArchiveState(cfg.db_path) as state, ArchiveClient(cfg, Credentials()) as cl
                                 cwd=root, stdout=subprocess.DEVNULL)
         if result.returncode != 1:
             raise RuntimeError('Unverified empty generation must fail verify')
+        if options.native_gui:
+            subprocess.run([str(python), '-I', '-c', NATIVE_GUI_SMOKE], check=True, cwd=root, timeout=45)
         subprocess.run([str(python), '-m', 'pip', 'check'], check=True, cwd=root)
         print('Wheel build / contents / isolated install / CLI smoke / resources: PASS')
 

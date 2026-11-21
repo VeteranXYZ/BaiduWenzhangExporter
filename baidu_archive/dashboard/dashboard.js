@@ -87,7 +87,7 @@ function jobCard(){
  ${active()?`<div class="progress-track" role="progressbar" aria-label="当前任务进度" ${job.total&&job.done?'aria-valuenow="'+Math.round(percent)+'" aria-valuemin="0" aria-valuemax="100"':''}><div class="progress-fill ${job.done?'':'busy'}" style="width:${percent}%"></div></div>`:'<div style="height:20px"></div>'}
  <div class="job-detail"><div>任务范围<strong>${job.args.keys.length?job.args.keys.length+' 篇文章':'账号收藏列表 / 本地归档'}</strong></div><div>本轮阶段<strong>${esc(job.phase)}</strong></div>${job.total&&job.done?`<div>已处理<strong>${job.done} / ${job.total}</strong></div>`:''}</div>
  <div class="row wrap">${active()?button(job.status==='stopping'?'正在停止…':'停止任务','stop','stop',job.status==='stopping'?'disabled':''):
- ['stopped','failed','partial'].includes(job.status)?'<button class="btn primary" data-action="resume">'+icon('play')+(job.status==='stopped'?'继续任务':'重试未完成部分')+'</button>':''}
+ !job.download&&['stopped','failed','partial'].includes(job.status)?'<button class="btn primary" data-action="resume">'+icon('play')+(job.status==='stopped'?'继续任务':'重试未完成部分')+'</button>':''}
  ${job.download?`<a class="btn primary" href="${esc(job.download)}" download>${icon('download')}下载导出包</a>`:''}${button('返回文章列表','go-archives','box')}</div>
  <details style="margin-top:16px"><summary>查看任务明细（${job.events.length} 条）</summary><div class="event-list">${job.events.map(e=>`<div class="event"><time>${esc(e.at.slice(11,19))}</time><span>${esc(e.message)}</span></div>`).join('')||'<p class="muted">任务尚无明细。</p>'}</div></details>`;
 }
@@ -154,7 +154,7 @@ window.addEventListener('hashchange',()=>{currentView=titles[location.hash.slice
 async function poll(){
  if(loading)return;loading=true;
  try{job=await api('/api/job');const signature=job?job.id+':'+job.status:'';
-  if(job?.id===pendingImageDownload && job.status==='completed' && job.download){pendingImageDownload=null;const link=document.createElement('a');link.href=job.download;link.download='';document.body.append(link);link.click();link.remove();toast('图片 ZIP 已生成。若未自动下载，请点击「下载导出包」。');}
+  if(job?.id===pendingImageDownload && ['completed','partial'].includes(job.status) && job.download){pendingImageDownload=null;const link=document.createElement('a');link.href=job.download;link.download='';document.body.append(link);link.click();link.remove();toast(job.status==='partial'?'已生成部分图片 ZIP。未纳入的图片已列入清单。':'图片 ZIP 已生成。若未自动下载，请点击「下载导出包」。');}
   if(signature!==lastJobSignature){lastJobSignature=signature;library=await api('/api/library');render();}
   else if(currentView==='tasks'&&job&&active()){const expanded=$('job-panel').querySelector('details')?.open; $('job-panel').innerHTML=jobCard(); if(expanded)$('job-panel').querySelector('details').open=true;}
  }catch{if(active())toast('与本地服务的连接中断，重新连接后可查看保存进度。');}finally{loading=false;}

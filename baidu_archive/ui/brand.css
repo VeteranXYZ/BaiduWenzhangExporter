@@ -1,0 +1,17 @@
+/* The two brand colors are the stops used in the 云散归岸 app icon. */
+:root {
+  --brand-blue: #1768ff;
+  --brand-sky: #55a7ff;
+  --brand-action: #145bde;
+  --brand-strong: #124cb3;
+  --brand-soft: #eaf2ff;
+  --brand-border: #d5e4ff;
+  --brand-paper: #f3f6fb;
+  --brand-ink: #172033;
+  --brand-muted: #536279;
+
+  /* Keep white labels readable at both ends of the gradient. */
+  --brand-banner: linear-gradient(120deg, var(--brand-strong),
+    var(--brand-action) 62%, var(--brand-blue));
+  --brand-banner-text: #fff;
+}

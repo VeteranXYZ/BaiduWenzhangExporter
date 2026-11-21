@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from .storage import IntegrityError, current_content_path, read_json, read_raw
-from .utils import sha256_bytes, safe_key_dirname
+from .utils import redact_url, sha256_bytes, safe_key_dirname
 
 
 def resource_identity(asset: dict) -> str:
@@ -62,6 +62,42 @@ def validate_downloaded_asset(config, asset: dict, *, expected_identity: str | N
     if asset.get('resource_identity') and asset['resource_identity'] != identity:
         return bad('resource_identity_mismatch')
     return {'ok': True, 'reason': None, 'path': target, 'body': body}
+
+
+def is_source_placeholder(asset: dict, reason: str | None = None) -> bool:
+    if reason == 'invalid_media_placeholder':
+        return True
+    error = str(asset.get('error') or '')
+    return reason in (None, 'not_downloaded') and (
+        'source_deleted_placeholder' in error or 'invalid_media_placeholder' in error)
+
+
+def missing_resource(asset: dict, validation: dict) -> dict:
+    """Record why one reference is absent from an export."""
+    reason = validation['reason']
+    if is_source_placeholder(asset, reason):
+        status = 'source_placeholder'
+    elif reason == 'legacy_unverified':
+        status = 'unverified'
+    elif reason != 'not_downloaded':
+        status = 'failed_integrity'
+    elif asset.get('download_attempted') or asset.get('download_status') == 'failed':
+        status = 'download_failed'
+        if asset.get('http_status') and asset['http_status'] != 200:
+            reason = f"http_{asset['http_status']}"
+        elif asset.get('http_status') == 200:
+            reason = 'response_not_usable'
+        elif (asset.get('error') or '').startswith(('ConnectError', 'ReadTimeout', 'ConnectTimeout')):
+            reason = asset['error'].split(':', 1)[0]
+    elif asset.get('kind') in {'embed', 'iframe', 'object'}:
+        status = 'external_embed'
+        reason = 'external_media_not_preserved'
+    else:
+        status = 'not_downloaded'
+    url = asset.get('resolved_url') or asset.get('original_url') or ''
+    return {'id': asset.get('id'), 'kind': asset.get('kind'), 'attribute': asset.get('attribute'),
+            'status': status, 'reason': reason, 'http_status': asset.get('http_status'),
+            'url': redact_url(url) if not url.startswith('data:') else None}
 
 
 def index_truth(state) -> dict:

@@ -52,14 +52,13 @@ class Log:
             pass
 
 
+def _command_config(args) -> Config:
+    return load_config(root=args.root, config_file=args.config, concurrency=args.concurrency,
+                       delay=args.delay, page_limit=args.page_limit)
+
+
 def _open(args) -> tuple[Config, ArchiveState, Log]:
-    config = load_config(root=args.root, config_file=args.config)
-    if getattr(args, "concurrency", None):
-        config.concurrency = args.concurrency
-    if getattr(args, "delay", None) is not None:
-        config.delay = args.delay
-    if getattr(args, "page_limit", None) is not None:
-        config.page_limit = args.page_limit
+    config = _command_config(args)
     config.ensure_dirs()
     return config, ArchiveState(config.db_path), Log(config.logs_dir, getattr(args, "verbose", False))
 
@@ -342,6 +341,8 @@ def cmd_export_selection(args) -> int:
         result = export_selection(config, state, keys=args.key, formats=args.format or ["md", "txt"],
                                   output=Path(args.output) if args.output else None)
         log("EXPORT", f"已导出 {result['count']} 篇 → {result['path']}")
+        if result['missing_resources']:
+            log("EXPORT", f"部分导出：{result['missing_resources']} 个资源引用未纳入，原因已列入 ZIP 清单。")
         log("EXPORT", f"ZIP SHA-256：{result['sha256']}")
         return 0
     finally:
@@ -352,7 +353,7 @@ def cmd_export_selection(args) -> int:
 def cmd_serve(args) -> int:
     from .server import serve
 
-    config = load_config(root=args.root, config_file=args.config)
+    config = _command_config(args)
     serve(config, port=args.port, config_file=Path(args.config) if args.config else None)
     return 0
 
@@ -428,7 +429,7 @@ def cmd_gui(args) -> int:
             file=sys.stderr,
         )
         return 2
-    config = load_config(root=args.root, config_file=args.config)
+    config = _command_config(args)
     config.ensure_dirs()
     launch(config, debug=args.debug)
     return 0
@@ -463,7 +464,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=None, help="配置文件（默认 config.json）")
     parser.add_argument("--concurrency", type=int, default=None, help="并发数（默认 2）")
     parser.add_argument("--delay", type=float, default=None, help="请求最小间隔秒（默认 0.8）")
-    parser.add_argument("--page-limit", type=int, default=None, help="列表单次请求条数（已实测支持 100）")
+    parser.add_argument("--page-limit", type=int, default=None, help="兼容旧命令。列表固定每页 30 条")
     parser.add_argument("--verbose", action="store_true")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -552,8 +553,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # 长驻进程（操作台、桌面窗口）自己按任务加锁，绝不能在整个进程生命周期里持有锁：
         # 否则窗口开着时，窗口内的下载、重试、整理、导入都会因「已有任务正在运行」失败。
-        guard = (nullcontext() if args.command in {"status", "import-curl", "serve", "gui"} else
-                 ArchiveLock(load_config(root=args.root, config_file=args.config).root))
+        guard = nullcontext()
+        if args.command != "import-curl":
+            config = _command_config(args)
+            for warning in config.ignored_settings.values():
+                print(warning, file=sys.stderr)
+            if args.command not in {"status", "serve", "gui"}:
+                guard = ArchiveLock(config.root)
         with guard:
             return args.func(args)
     except ArchiveBusy as exc:

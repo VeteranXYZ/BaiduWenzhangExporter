@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from dataclasses import dataclass, field, asdict
@@ -30,7 +31,7 @@ LIST_URL_CANDIDATES = (
 
 # 列表接口每页条数由百度决定，实测固定为 30。它不是可调参数：
 # 一旦与已保存的原始列表页（按 0/30/60… 存放）对不上，索引就永远无法离线核实，
-# 每次都会报 unexpected_limit。所以配置文件与环境变量里的 page_limit 一律忽略。
+# 每次都会报 unexpected_limit。用户配置里的 page_limit 一律以接口的固定值为准。
 BAIDU_PAGE_LIMIT = 30
 
 # 下载速度的安全边界。百度空间是个遗留服务，太快会被限流甚至影响账号；
@@ -159,9 +160,18 @@ def _coerce(value: str, current):
     return value
 
 
-def load_config(root: str | os.PathLike[str] | None = None, config_file: str | os.PathLike[str] | None = None) -> Config:
+def load_config(
+    root: str | os.PathLike[str] | None = None,
+    config_file: str | os.PathLike[str] | None = None,
+    *,
+    concurrency: int | None = None,
+    delay: float | None = None,
+    page_limit: int | None = None,
+) -> Config:
     """加载配置。``config.json`` 与环境变量 ``BAIDU_ARCHIVE_*`` 均为可选。"""
     cfg = Config()
+    defaults = vars(cfg).copy()
+    requested_page_limit = BAIDU_PAGE_LIMIT
     if root:
         cfg.root = Path(root)
 
@@ -176,10 +186,7 @@ def load_config(root: str | os.PathLike[str] | None = None, config_file: str | o
                 if not root:
                     cfg.root = Path(value)
             elif key == "page_limit":
-                if value != BAIDU_PAGE_LIMIT:
-                    cfg.ignored_settings["page_limit"] = (
-                        f"配置文件中的每页条数 {value} 已忽略：百度接口固定每页 {BAIDU_PAGE_LIMIT} 条"
-                    )
+                requested_page_limit = value
             elif key == "ignored_settings":
                 continue
             elif hasattr(cfg, key):
@@ -201,34 +208,49 @@ def load_config(root: str | os.PathLike[str] | None = None, config_file: str | o
         for name, value in (session.get("extra_headers") or {}).items():
             cfg.extra_headers.setdefault(name, value)
 
-    for name in list(vars(cfg)):
+    for name, default in defaults.items():
         env_name = f"BAIDU_ARCHIVE_{name.upper()}"
         if env_name in os.environ and os.environ[env_name] != "":
-            current = getattr(cfg, name)
             if name == "root":
                 if not root:
                     cfg.root = Path(os.environ[env_name])
-            elif isinstance(current, (dict, list)):
+            elif isinstance(default, (dict, list)):
                 continue
             elif name == "page_limit":
-                continue
+                requested_page_limit = os.environ[env_name]
             else:
-                setattr(cfg, name, _coerce(os.environ[env_name], current))
+                value = os.environ[env_name]
+                try:
+                    setattr(cfg, name, _coerce(value, default))
+                except ValueError:
+                    if name not in {'concurrency', 'delay'}:
+                        raise
+                    setattr(cfg, name, value)  # 留给下方的范围校验处理无效值
 
+    if concurrency is not None:
+        cfg.concurrency = concurrency
+    if delay is not None:
+        cfg.delay = delay
+    if page_limit is not None:
+        requested_page_limit = page_limit
+    if str(requested_page_limit) != str(BAIDU_PAGE_LIMIT):
+        cfg.ignored_settings["page_limit"] = f"已忽略自定义分页设置。百度接口固定每页 {BAIDU_PAGE_LIMIT} 条。"
     _clamp_speed(cfg)
     return cfg
 
 
 def _clamp_speed(cfg: Config) -> None:
     """把下载速度收回安全边界。被收回的设置记录在 ignored_settings，供界面说明。"""
-    if not isinstance(cfg.concurrency, int) or cfg.concurrency < 1:
+    if type(cfg.concurrency) is not int or cfg.concurrency < 1:
+        cfg.ignored_settings["concurrency"] = f"同时下载数无效，已恢复默认值 {SAFE_CONCURRENCY}。"
         cfg.concurrency = SAFE_CONCURRENCY
     elif cfg.concurrency > MAX_CONCURRENCY:
         cfg.ignored_settings["concurrency"] = (
             f"配置中的同时下载数 {cfg.concurrency} 过高，已按上限 {MAX_CONCURRENCY} 执行")
         cfg.concurrency = MAX_CONCURRENCY
-    if not isinstance(cfg.delay, (int, float)) or cfg.delay < MIN_DELAY:
-        if isinstance(cfg.delay, (int, float)):
-            cfg.ignored_settings["delay"] = (
-                f"配置中的请求间隔 {cfg.delay} 秒过快，已按下限 {MIN_DELAY} 秒执行")
-        cfg.delay = max(MIN_DELAY, float(cfg.delay) if isinstance(cfg.delay, (int, float)) else SAFE_DELAY)
+    if type(cfg.delay) not in (int, float) or not math.isfinite(cfg.delay):
+        cfg.ignored_settings["delay"] = f"请求间隔无效，已恢复默认值 {SAFE_DELAY} 秒。"
+        cfg.delay = SAFE_DELAY
+    elif cfg.delay < MIN_DELAY:
+        cfg.ignored_settings["delay"] = f"请求间隔 {cfg.delay} 秒过快，已按下限 {MIN_DELAY} 秒执行。"
+        cfg.delay = MIN_DELAY

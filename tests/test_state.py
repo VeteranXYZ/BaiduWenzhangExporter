@@ -90,6 +90,11 @@ def test_assets_roundtrip(state):
     assets = state.assets_for("K1")
     assert len(assets) == 1
     assert assets[0]["download_status"] == "ok"
+    assert state.get_asset(assets[0]["id"]) == assets[0]
+    assert state.get_asset(assets[0]["id"] + 1) is None
+    state.set_current_assets("K1", [])
+    assert state.get_asset(assets[0]["id"]) is None
+    assert state.assets_for("K1", include_inactive=True) == [{**assets[0], "active": 0}]
 
 
 def test_asset_upsert_is_unique_per_attribute(state):

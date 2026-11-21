@@ -2,20 +2,15 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>百度空间归档</title>
+<link rel="icon" href="icon.png" type="image/png">
+<link rel="stylesheet" href="brand.css">
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
 
 <svg style="display:none">
-  <!-- 品牌标记「云散归岸」：消散的云弧 + 下行箭头 + 厚实地基，与应用图标同形 -->
-  <symbol id="i-box" viewBox="0 0 24 24">
-    <path d="M7.1 9.7a5.1 3.9 0 0 1 9.8 0" fill="none" stroke="currentColor" stroke-width="1.5"
-          stroke-linecap="round" stroke-dasharray="3.3 2.1" opacity=".62"/>
-    <rect x="11.15" y="9.2" width="1.7" height="4.9" rx="0.85" fill="currentColor"/>
-    <path d="M12 16.6 8.9 12.7h6.2z" fill="currentColor"/>
-    <rect x="4.9" y="17.8" width="14.2" height="2.2" rx="1.1" fill="currentColor"/>
-  </symbol>
   <symbol id="i-home" viewBox="0 0 24 24"><path fill="currentColor" d="M12 3 3 10v11h6v-6h6v6h6V10z"/></symbol>
   <symbol id="i-inbox" viewBox="0 0 24 24"><path fill="currentColor" d="M4 4h16a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1m1 9v5h14v-5h-4a3 3 0 0 1-6 0zm0-7v5h6l3 3 3-3h2V6z"/></symbol>
   <symbol id="i-image" viewBox="0 0 24 24"><path fill="currentColor" d="M4 4h16a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1m1 2v9.6l3.5-3.4 4 3.9L15 13l4 3.9V6zM8 7.5A1.5 1.5 0 1 1 8 10a1.5 1.5 0 0 1 0-2.5"/></symbol>
@@ -28,42 +23,46 @@
   <symbol id="i-user" viewBox="0 0 24 24"><path fill="currentColor" d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8m0 2c-4 0-8 2-8 4.5V21h16v-2.5c0-2.5-4-4.5-8-4.5"/></symbol>
   <symbol id="i-db" viewBox="0 0 24 24"><path fill="currentColor" d="M12 2c4.4 0 8 1.3 8 3v14c0 1.7-3.6 3-8 3s-8-1.3-8-3V5c0-1.7 3.6-3 8-3m0 2c-3.5 0-6 .9-6 1s2.5 1 6 1 6-.9 6-1-2.5-1-6-1M6 7.5V11c0 .1 2.5 1 6 1s6-.9 6-1V7.5c-1.5.6-3.7 1-6 1s-4.5-.4-6-1m0 6V17c0 .1 2.5 1 6 1s6-.9 6-1v-3.5c-1.5.6-3.7 1-6 1s-4.5-.4-6-1"/></symbol>
   <symbol id="i-doc" viewBox="0 0 24 24"><path fill="currentColor" d="M6 2h8l5 5v15H6zm7 1.5V8h4.5zM8 11h8v2H8zm0 4h8v2H8z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><path d="m16 16 4 4m-2-9a7 7 0 1 1-14 0 7 7 0 0 1 14 0Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-panel" viewBox="0 0 24 24"><path d="M4 5h16v14H4zM10 5v14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
 </svg>
 
-<div class="titlebar-drag"></div>
-
 <div class="app-shell" id="shell">
-  <aside class="sidebar">
+  <aside class="sidebar" aria-label="应用导航">
     <div class="brand">
-      <button class="brand-mark" id="toggleSidebar" title="折叠侧边栏"><svg width="26" height="26"><use href="#i-box"/></svg></button>
-      <div class="brand-copy"><strong>百度空间归档</strong><span>BAIDU ARCHIVE</span></div>
+      <img class="brand-mark" src="icon.png" width="34" height="34" alt="">
+      <span class="brand-copy">百度空间归档</span>
     </div>
-    <nav class="side-nav">
-      <a class="active" data-page="dashboard"><span class="ico"><svg width="17" height="17"><use href="#i-home"/></svg></span><span>首页</span></a>
-      <a data-page="archives"><span class="ico"><svg width="17" height="17"><use href="#i-inbox"/></svg></span><span>文章</span></a>
-      <a data-page="media"><span class="ico"><svg width="17" height="17"><use href="#i-image"/></svg></span><span>图片</span></a>
-      <a data-page="export"><span class="ico"><svg width="17" height="17"><use href="#i-export"/></svg></span><span>导出</span></a>
+    <nav class="side-nav" aria-label="主导航">
+      <button type="button" class="nav-item" data-page="dashboard" aria-label="归档概览" title="归档概览"><svg aria-hidden="true"><use href="#i-home"/></svg><span>归档概览</span></button>
+      <button type="button" class="nav-item" data-page="archives" aria-label="文章" title="文章"><svg aria-hidden="true"><use href="#i-inbox"/></svg><span>文章</span></button>
+      <button type="button" class="nav-item" data-page="media" aria-label="图片" title="图片"><svg aria-hidden="true"><use href="#i-image"/></svg><span>图片</span></button>
+      <button type="button" class="nav-item" data-page="missing" aria-label="缺失内容" title="缺失内容"><svg aria-hidden="true"><use href="#i-alert"/></svg><span>缺失内容</span></button>
+      <button type="button" class="nav-item" data-page="export" aria-label="导出" title="导出"><svg aria-hidden="true"><use href="#i-export"/></svg><span>导出</span></button>
     </nav>
     <div class="sidebar-footer">
-      <a data-page="settings"><span class="ico"><svg width="17" height="17"><use href="#i-cog"/></svg></span><span>设置</span></a>
+      <button type="button" class="nav-item" data-page="settings" aria-label="设置" title="设置"><svg aria-hidden="true"><use href="#i-cog"/></svg><span>设置</span></button>
+      <button type="button" class="nav-item" id="toggleSidebar" aria-expanded="true" aria-label="折叠侧边栏" title="切换侧边栏"><svg aria-hidden="true"><use href="#i-panel"/></svg><span>折叠侧栏</span></button>
     </div>
   </aside>
-
   <div class="workspace">
     <header class="topbar">
-      <div>
-        <p class="eyebrow">BAIDU ARCHIVE</p>
-        <h1 id="pageTitle">概览</h1>
-      </div>
+      <h1 id="pageTitle" tabindex="-1">归档概览</h1>
       <div class="topbar-actions">
-        <button class="icon-btn" id="themeBtn" title="切换主题"><svg width="16" height="16"><use href="#i-moon" id="themeIcon"/></svg></button>
-        <button class="account-chip" id="accountBtn">
-          <span class="account-avatar"><svg width="15" height="15"><use href="#i-user"/></svg></span>
-          <span class="account-copy"><strong id="acctName">尚未登录</strong><small id="acctSub">点击导入 Cookie</small></span>
-        </button>
+        <button type="button" id="taskIndicator" class="task-indicator" data-goto="dashboard" hidden><i aria-hidden="true"></i><span>任务进行中</span></button>
+        <button type="button" class="icon-btn" id="themeBtn" title="切换主题" aria-label="切换主题"><svg width="17" height="17" aria-hidden="true"><use href="#i-moon" id="themeIcon"/></svg></button>
+        <div class="account">
+          <button type="button" class="account-chip" id="accountBtn" aria-controls="accountMenu" aria-expanded="false">
+            <svg width="16" height="16" aria-hidden="true"><use href="#i-user"/></svg><span id="acctName">登录百度</span>
+          </button>
+          <div id="accountMenu" class="account-menu" hidden>
+            <button type="button" data-goto="settings">账号设置</button>
+            <button type="button" data-act="login">重新登录</button>
+            <button type="button" data-act="logout">退出登录</button>
+          </div>
+        </div>
       </div>
     </header>
-
     <main class="content" id="content"></main>
   </div>
 </div>

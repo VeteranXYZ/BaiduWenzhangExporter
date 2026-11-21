@@ -230,6 +230,26 @@ def test_images_invalid_or_empty_selection_does_not_start(application, data):
     assert application.snapshot() is None
 
 
+def test_partial_image_zip_remains_available_for_download(http):
+    import io
+    import zipfile
+
+    client, app = http
+    image_fixture(app, 'one')
+    image_fixture(app, 'two')
+    (app.config.item_dir('one') / 'assets' / 'image.png').write_bytes(b'broken')
+    app.start({'kind': 'export_images', 'scope': 'all'})
+    job = completed(app)
+    assert job['status'] == 'partial' and job['result']['images'] == 1
+    response = client.get(job['download'])
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as bundle:
+        manifest = json.loads(bundle.read('manifest.json'))
+        assert manifest['not_downloaded'] == 1
+        assert manifest['entries'][0]['not_downloaded'][0]['status'] == 'failed_integrity'
+    assert app.library()['history'][0]['download'] == job['download']
+
+
 def test_cancelled_browser_download_does_not_attempt_second_response(application):
     from types import SimpleNamespace
     handler = object.__new__(server.Handler)

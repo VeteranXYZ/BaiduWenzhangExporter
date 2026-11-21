@@ -12,21 +12,29 @@ import json
 import os
 import subprocess
 import sys
+from collections import OrderedDict
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import webview
 from webview.menu import Menu, MenuAction, MenuSeparator
 
 from .config import Config, load_config
-from .state import ArchiveState
-from .utils import utcnow_iso
+from .locking import ArchiveLock
+from .state import SCHEMA_VERSION, ArchiveState, backup_before_migration, database_version
+from .storage import write_json_atomic
+from .utils import bookmark_url, utcnow_iso
 from .truth import article_truth, index_truth, validate_downloaded_asset, resource_state
 
 UI_DIR = Path(__file__).parent / "ui"
 
-WINDOW_MIN = (900, 620)
+WINDOW_MIN = (720, 540)
 WINDOW_DEFAULT = (1180, 780)
+THUMBNAIL_CACHE_ENTRIES = 128
+THUMBNAIL_CACHE_BYTES = 8 * 1024 * 1024
+THUMBNAIL_MAX_SIZE = 1024
+_PREFS_LOCK = Lock()
 
 
 def _prefs_path() -> Path:
@@ -43,16 +51,18 @@ def _prefs_path() -> Path:
 
 def _load_prefs() -> dict[str, Any]:
     try:
-        return json.loads(_prefs_path().read_text(encoding="utf-8"))
+        prefs = json.loads(_prefs_path().read_text(encoding="utf-8"))
+        return prefs if isinstance(prefs, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
 
 
-def _save_prefs(data: dict[str, Any]) -> None:
-    try:
-        _prefs_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        pass
+def _update_prefs(**changes: Any) -> None:
+    with _PREFS_LOCK:
+        try:
+            write_json_atomic(_prefs_path(), {**_load_prefs(), **changes})
+        except OSError:
+            pass
 
 
 def _human_bytes(count: int) -> str:
@@ -141,21 +151,28 @@ def _plain_failure(asset: dict[str, Any]) -> str:
     code = asset.get("http_status")
     if asset.get("validation_reason") == "invalid_media_placeholder" or "placeholder" in error:
         return "百度已删除原图，只返回了一张「图片不存在」占位图"
+    if asset.get("download_status") == "ok":
+        return "本地图片文件缺失，或未通过校验"
     if "不是可识别的图片" in (asset.get("error") or ""):
-        return "原网站返回的是网页而不是图片（图片已失效，常见于图床关闭或改为占位图）"
+        return "原网站返回的是网页而不是图片"
     if code == 404:
-        return "原图已被删除"
+        return "原地址找不到图片（HTTP 404）"
     if code in (401, 403):
-        return "原网站拒绝访问（防盗链或已关闭）"
+        return "原网站拒绝访问"
     if isinstance(code, int) and 500 <= code < 600:
-        return "原网站服务器出错或已停止运营"
+        return f"原网站服务器出错（HTTP {code}）"
     if isinstance(code, int) and 400 <= code < 500:
         return "原网站拒绝了请求"
     if "connect" in error or "name" in error or "resolve" in error:
-        return "原网站已无法连接（很可能已关闭）"
+        return "请求时无法连接原网站"
     if "timeout" in error or "超时" in error:
         return "原网站长时间无响应"
     return asset.get("error") or "下载失败"
+
+
+def _saved_article_keys(config: Config, state: ArchiveState) -> list[str]:
+    return [record["key"] for record in state.iter_records("page")
+            if article_truth(config, state, record["key"])["available"]]
 
 
 def _reveal(path: Path) -> None:
@@ -180,6 +197,8 @@ class Api:
         # 懒建：Application 会在构造时创建目录、读任务状态并生成令牌，
         # 没必要在窗口还没打开时就做这些。
         self._application: Any = None
+        self._thumbs: OrderedDict[tuple, str] = OrderedDict()
+        self._thumb_lock = Lock()
 
     # ---------- 数据 ----------
     EMPTY_STATS = {
@@ -343,6 +362,16 @@ class Api:
                 folder = self.config.item_dir(key)
                 meta = read_json(folder / "metadata.json", {}) or {}
                 soup = make_soup(reading_html(validated_reading_content(self.config, state, key)))
+                # 桌面阅读器离线显示正文。链接地址保留在提示和导出的原文中。
+                for link in soup.find_all("a"):
+                    href = link.get("href") or link.get("xlink:href")
+                    if href and not href.startswith("#"):
+                        link.attrs.pop("href", None)
+                        link.attrs.pop("xlink:href", None)
+                        if not link.get("title"):
+                            link["title"] = href
+                local_assets = {a['local_path']: a for a in state.assets_for(key)
+                                if a.get('local_path') and a.get('kind') in {'image', 'video', 'audio', 'media-source'}}
 
                 budget = 24 * 1024 * 1024          # 单篇内联上限，避免超长图文撑爆 WebView
                 used = 0
@@ -352,28 +381,23 @@ class Api:
                     node.attrs.pop("srcset", None)   # 多分辨率候选无法内联，直接去掉
                     if src.startswith("data:"):
                         continue
-                    target = folder / src
-                    if not (src.startswith("assets/") and len(Path(src).parts) == 2
-                            and target.is_file()):
+                    asset = local_assets.get(src)
+                    validation = validate_downloaded_asset(self.config, asset) if asset else {'ok': False}
+                    if not validation['ok']:
                         node.attrs.pop("src", None)
                         node["alt"] = node.get("alt") or "图片未能保存"
                         node["data-archive-missing"] = "1"
                         skipped += 1
                         continue
-                    try:
-                        body = target.read_bytes()
-                    except OSError:
-                        node.attrs.pop("src", None)
-                        node["data-archive-missing"] = "1"
-                        skipped += 1
-                        continue
+                    # 使用同一文件描述符读出并校验的字节，不能再按路径重读。
+                    body = validation['body']
                     if used + len(body) > budget:
                         node.attrs.pop("src", None)
                         node["alt"] = "图片过大，未在预览中载入"
                         node["data-archive-skipped"] = "1"
                         skipped += 1
                         continue
-                    mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+                    mime = mimetypes.guess_type(validation['path'].name)[0] or "application/octet-stream"
                     node["src"] = f"data:{mime};base64," + base64.b64encode(body).decode("ascii")
                     used += len(body)
                     inlined += 1
@@ -394,6 +418,17 @@ class Api:
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc)[:200]}
 
+    def open_bookmark(self, key: str) -> bool:
+        """Open only an address preserved in the current archive catalog."""
+        import webbrowser
+
+        if not key or not self.config.db_path.is_file():
+            return False
+        with ArchiveState(self.config.db_path) as state:
+            record = state.get_record(key)
+        url = bookmark_url(record) if record else None
+        return bool(url and webbrowser.open(url, new=2))
+
     def get_task(self) -> dict[str, Any] | None:
         try:
             return self._app().snapshot()
@@ -412,6 +447,9 @@ class Api:
             return self._app().stop()
         except Exception:  # noqa: BLE001
             return None
+
+    def retry_images(self, asset_ids: list[int]) -> dict[str, Any]:
+        return self.start_task("retry_images", asset_ids=asset_ids)
 
     # ---------- 凭证 ----------
     def start_login(self) -> dict[str, Any]:
@@ -464,9 +502,19 @@ class Api:
         }
 
     # ---------- 导出 ----------
-    def export_to(self, what: str, keys: list[str] | None = None) -> dict[str, Any]:
+    def _export_directory(self, use_archive_directory: bool) -> str | None:
+        if use_archive_directory is True:
+            directory = self.config.root / "exports"
+            directory.mkdir(parents=True, exist_ok=True)
+            return str(directory.resolve())
+        return self.choose_directory()
+
+    def export_to(self, what: str, keys: list[str] | None = None,
+                  use_archive_directory: bool = False) -> dict[str, Any]:
         """原生目录选择器 + 实际导出。``what`` 为 selection / images。"""
-        directory = self.choose_directory()
+        if what not in {"selection", "images"}:
+            return {"ok": False, "error": "未知导出格式"}
+        directory = self._export_directory(use_archive_directory)
         if not directory:
             return {"ok": False, "cancelled": True}
         from uuid import uuid4
@@ -475,10 +523,11 @@ class Api:
 
         target = Path(directory) / f"{what}-{uuid4().hex[:8]}.zip"
         try:
-            with ArchiveState(self.config.db_path) as state:
+            with ArchiveLock(self.config.root), ArchiveState(self.config.db_path) as state:
                 chosen = list(keys or [])
                 if not chosen:
-                    chosen = [r["key"] for r in state.iter_records("page")]
+                    chosen = (_saved_article_keys(self.config, state) if what == "selection" else
+                              [r["key"] for r in state.iter_records("page")])
                 if what == "images":
                     result = export_images(self.config, state, keys=chosen, output=target)
                 else:
@@ -486,13 +535,14 @@ class Api:
                     # 早先这里漏传 formats，导致「导出所选文章」每次都抛 TypeError。
                     result = export_selection(self.config, state, keys=chosen,
                                               formats=["md", "txt"], output=target)
-            _notify("导出完成", f"{target.name} 已保存")
+            missing = result.get("missing_resources", result.get("not_downloaded", 0))
+            _notify("部分导出" if missing else "导出完成", f"{target.name} 已保存")
             return {"ok": True, "path": str(target), **(result or {})}
         except Exception as exc:  # noqa: BLE001
             _notify("导出失败", str(exc)[:120])
             return {"ok": False, "error": str(exc)[:200]}
 
-    def export_all(self) -> dict[str, Any]:
+    def export_all(self, use_archive_directory: bool = False) -> dict[str, Any]:
         """一键导出全部：生成一个可以长期保存、离线打开的完整归档包。
 
         用户最在意的就是这一件事 —— 把所有东西拿出来，百度关了也能看。
@@ -510,7 +560,7 @@ class Api:
         只读取本地已校验通过的内容，不发任何网络请求；损坏或缺失的图片不会被
         打进包里，但原始 URL 仍保留在正文与总目录中。
         """
-        directory = self.choose_directory()
+        directory = self._export_directory(use_archive_directory)
         if not directory:
             return {"ok": False, "cancelled": True}
 
@@ -519,12 +569,15 @@ class Api:
             return {"ok": False, "error": "有任务正在进行，请等它结束或先停止后再导出"}
 
         import shutil
+        from dataclasses import replace
         from datetime import datetime
+        from tempfile import mkdtemp
 
         from .export import export_wxr
         from .pipeline import export_master_index
-        from .selection import export_selection
+        from .selection import export_preservation, export_selection
         from .site import export_reading_site
+        from .utils import sha256_file
 
         stamp = datetime.now().strftime("%Y%m%d-%H%M")
         package = Path(directory) / f"百度空间归档-{stamp}"
@@ -532,21 +585,22 @@ class Api:
         while package.exists():                  # 绝不覆盖已有导出
             suffix += 1
             package = Path(directory) / f"百度空间归档-{stamp}-{suffix}"
-        building = package.with_name("." + package.name + ".partial")
-        shutil.rmtree(building, ignore_errors=True)
-        building.mkdir(parents=True)
-
+        building = None
         report: dict[str, Any] = {"articles": 0, "warnings": []}
+        resources: dict = {'schema_version': 1, 'included': [], 'missing': [], 'missing_articles': []}
         try:
-            with ArchiveState(self.config.db_path) as state:
+            with ArchiveLock(self.config.root), ArchiveState(self.config.db_path) as state:
+                building = Path(mkdtemp(prefix=f".{package.name}-", suffix=".partial", dir=directory))
                 # 1) 可离线浏览的阅读站 —— 包的核心
-                report["articles"] = export_reading_site(self.config, state, building)
+                report["articles"] = export_reading_site(self.config, state, building, resource_report=resources)
+                report["missing_resources"] = len(resources['missing'])
+                write_json_atomic(building / "缺失与资源清单.json", resources)
                 entry = building / "index.html"
                 if entry.exists():
                     shutil.copyfile(entry, building / "打开归档.html")
 
                 # 2) Markdown / TXT
-                pages = [r["key"] for r in state.iter_records("page")]
+                pages = _saved_article_keys(self.config, state)
                 if pages:
                     try:
                         export_selection(self.config, state, keys=pages, formats=["md", "txt"],
@@ -556,41 +610,55 @@ class Api:
 
                 # 3) WordPress 迁移包
                 try:
-                    wxr = export_wxr(self.config, state)
-                    shutil.copyfile(wxr, building / "WordPress导入.xml")
+                    export_wxr(self.config, state, filename=str(building.resolve() / "WordPress导入.xml"))
                 except Exception as exc:  # noqa: BLE001
                     report["warnings"].append(f"WordPress 导入包未生成：{exc}"[:160])
 
                 # 4) 总目录：全部记录（含外部收藏），保留原始顺序
-                export_master_index(self.config, state)
+                export_master_index(replace(self.config, root=building), state)
                 for src, dst in (("master_index.csv", "总目录.csv"), ("master_index.json", "总目录.json")):
-                    if (self.config.root / src).exists():
-                        shutil.copyfile(self.config.root / src, building / dst)
+                    (building / src).rename(building / dst)
+                (building / 'crawl_state.json').unlink()
+                export_preservation(self.config, state, building / "原始文件与版本.zip")
 
                 total = state.count_records()
 
+            optional = {
+                '文本版-Markdown与TXT.zip': '已保存文章的 Markdown、TXT、通过校验的媒体及缺失清单',
+                'WordPress导入.xml': '文章迁移文件。媒体仍引用原站；可用资源和本地路径见「缺失与资源清单.json」',
+            }
             (building / "说明.txt").write_text(
                 "百度空间归档 · 导出包\n"
                 f"生成时间：{datetime.now():%Y-%m-%d %H:%M}\n\n"
                 "打开归档.html          双击即可浏览全部文章（按年份分组、可搜索、图片在本地）\n"
                 "articles/              每篇文章一页，图片随附\n"
-                "文本版-Markdown与TXT.zip  纯文本格式，便于搜索或迁移到 Obsidian、Hugo 等\n"
-                "WordPress导入.xml      在 WordPress 后台「工具 → 导入 → WordPress」使用\n"
-                "总目录.csv / .json     全部收藏记录（含外部收藏），保留百度列表的原始顺序\n\n"
+                "总目录.csv / .json     全部收藏记录（含外部收藏），保留百度列表的原始顺序\n"
+                "缺失与资源清单.json     缺失原因、原始地址线索及已归档媒体的本地路径与摘要\n"
+                "原始文件与版本.zip      原始响应、正文、历史文件及数据库；仅供私下保存和恢复\n"
+                "导出校验清单.json       本包文件的字节数和 SHA-256\n"
+                + "".join(f"{name}  {detail}\n" for name, detail in optional.items() if (building / name).is_file())
+                + "".join(f"未生成：{warning}\n" for warning in report['warnings'])
+                + "\n"
                 f"共 {total} 条记录，其中 {report['articles']} 篇文章可阅读。\n"
-                "本包只包含校验通过的内容；未能保存的图片在正文中显示为占位，原始地址仍保留。\n"
-                "整个文件夹不依赖网络，百度服务关闭后依然可以打开。\n",
+                f"另有 {len(resources['missing'])} 个媒体引用、{len(resources['missing_articles'])} 篇正文未包含在阅读版。\n"
+                "阅读版使用已校验的本地文件，并为缺失媒体添加可读说明。原始证据另外保留。\n",
                 encoding="utf-8",
             )
+            files = [{'path': path.relative_to(building).as_posix(), 'bytes': path.stat().st_size,
+                      'sha256': sha256_file(path)} for path in sorted(building.rglob('*')) if path.is_file()]
+            write_json_atomic(building / "导出校验清单.json", {'schema_version': 1, 'files': files})
             building.rename(package)             # 全部写完才发布，中途失败不会留下半成品
         except Exception as exc:  # noqa: BLE001
-            shutil.rmtree(building, ignore_errors=True)
+            if building is not None:
+                shutil.rmtree(building, ignore_errors=True)
             _notify("导出失败", str(exc)[:120])
             return {"ok": False, "error": str(exc)[:200]}
 
-        _notify("导出完成", f"{report['articles']} 篇文章已导出到 {package.name}")
+        partial = report['missing_resources'] or resources['missing_articles'] or report['warnings']
+        _notify("部分导出" if partial else "导出完成", f"{report['articles']} 篇文章已导出到 {package.name}")
         _reveal(package / "打开归档.html" if (package / "打开归档.html").exists() else package)
-        return {"ok": True, "path": str(package), **report}
+        return {"ok": True, "path": str(package), **report,
+                "missing_articles": len(resources['missing_articles'])}
 
     # ---------- 健康检查与离线修复 ----------
     def _busy(self) -> bool:
@@ -618,6 +686,8 @@ class Api:
         if not report["has_db"]:
             return report
         try:
+            if database_version(self.config.db_path) < SCHEMA_VERSION:
+                return {**report, "needs_offline_repair": True}
             with ArchiveState(self.config.db_path) as state:
                 index = index_truth(state)
                 legacy_assets = sum(
@@ -649,44 +719,15 @@ class Api:
         if self._busy():
             return {"state": "busy", "migrated": False}
         report = self.health()
+        if report.get("error"):
+            return {"state": "error", "migrated": False, "error": report["error"]}
         if not report.get("needs_offline_repair"):
             return {"state": "ready", "migrated": False}
 
-        backup = self._backup_database("before-migration")
         result = self.repair_offline()
-        if result.get("ok"):
-            try:
-                with ArchiveState(self.config.db_path) as state:
-                    state.set_meta("migrated_at", utcnow_iso())
-                    state.set_meta("migration_backup", str(backup) if backup else None)
-            except Exception:  # noqa: BLE001
-                pass
         return {"state": "ready" if result.get("ok") else "error", "migrated": bool(result.get("ok")),
-                "backup": str(backup) if backup else None, "error": result.get("error"),
+                "backup": result.get("backup"), "error": result.get("error"),
                 "after": result.get("after")}
-
-    def _backup_database(self, label: str) -> Path | None:
-        """用 SQLite 在线备份接口拷一份快照（WAL 模式下直接复制文件会漏掉未合并的写入）。"""
-        import sqlite3
-        from datetime import datetime
-
-        folder = self.config.root / "backups"
-        folder.mkdir(parents=True, exist_ok=True)
-        target = folder / f"state-{label}-{datetime.now():%Y%m%d-%H%M%S}.db"
-        try:
-            source = sqlite3.connect(str(self.config.db_path))
-            try:
-                destination = sqlite3.connect(str(target))
-                try:
-                    source.backup(destination)
-                finally:
-                    destination.close()
-            finally:
-                source.close()
-            return target
-        except sqlite3.Error:
-            target.unlink(missing_ok=True)
-            return None
 
     def repair_offline(self) -> dict[str, Any]:
         """离线整理旧版本归档。只读写本地记录，从不下载、也从不改写任何下载结果。
@@ -703,15 +744,16 @@ class Api:
         if self._busy():
             return {"ok": False, "error": "有任务正在进行，请等它结束后再整理"}
         from .legacy import rebuild_legacy_evidence
-        from .locking import ArchiveLock
         from .pipeline import run_index
 
         steps: dict[str, Any] = {}
-        before = self.get_verified_stats()
+        backup = None
         client = _offline_client(self.config)
         quiet = lambda *_a, **_k: None  # noqa: E731 —— 整理过程不需要逐条输出
         try:
             with ArchiveLock(self.config.root), ArchiveState(self.config.db_path) as state:
+                backup = state.schema_backup or backup_before_migration(self.config.db_path)
+                before = self.get_verified_stats()
                 try:
                     run_index(self.config, state, client, force=False, log=quiet)
                     steps["index"] = "ok"
@@ -719,25 +761,32 @@ class Api:
                     steps["index"] = f"原始列表页不完整，下次「检查更新」时会重新读取（{type(exc).__name__}）"
                 steps["legacy"] = rebuild_legacy_evidence(self.config, state)
                 steps["reconciled"] = _reconcile_statuses(self.config, state)
+                state.set_meta("migrated_at", utcnow_iso())
+                state.set_meta("migration_backup", str(backup))
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": str(exc)[:200], "steps": steps}
+            return {"ok": False, "error": str(exc)[:200], "steps": steps,
+                    "backup": str(backup) if backup else None}
         finally:
             client.close()
 
         self._application = None
         after = self.get_verified_stats()
-        return {"ok": True, "before": before, "after": after, "steps": steps}
+        return {"ok": True, "before": before, "after": after, "steps": steps, "backup": str(backup)}
 
     def get_problems(self) -> dict[str, Any]:
         """按「原因」而不是按「状态码」分组，每组配上对症的处理方式。"""
-        from .truth import article_truth, resource_state
+        from .assets import image_retry_urls
+        from .storage import current_content_path, read_json
+        from .truth import article_truth, is_source_placeholder, resource_state
+        from .utils import redact_url
 
         groups: dict[str, list[dict[str, Any]]] = {
             "baidu_deleted": [],   # 百度图床删了原图，只给「图片不存在」占位图
-            "dead_images": [],     # 第三方网站已失效：无法挽回，只保留原址
+            "dead_images": [],     # 图片请求失败，或本地文件无法通过校验
             "not_saved": [],       # 正文没下载下来：可以重新下载
             "auth": [],            # 登录失效导致的失败：重新登录后再下载
             "unverified": [],      # 旧数据待校验：一键离线修复
+            "external_embeds": [],
         }
         if not self.config.db_path.exists():
             return groups
@@ -754,31 +803,48 @@ class Api:
                 if not facts["available"]:
                     groups["not_saved"].append({**base, "error": (item.get("last_error") or "")[:120]})
                     continue
-                dead, deleted = [], []
+                dead, deleted, unverified, embeds = [], [], [], []
+                source = None
+                base_url = None
                 for asset in state.assets_for(key):
+                    if asset.get("kind") in {"embed", "object", "iframe"}:
+                        embeds.append({"url": redact_url(asset.get("resolved_url") or asset["original_url"]),
+                                       "domain": asset.get("domain") or "", "reason": "旧站嵌入无法离线播放"})
+                        continue
                     if asset.get("kind") != "image":
                         continue
                     resource = resource_state(self.config, asset)
                     if resource["state"] == "legacy_unverified":
-                        groups["unverified"].append(base)
-                        dead = deleted = None
-                        break
+                        unverified.append({"domain": asset.get("domain") or "", "reason": resource["reason"]})
+                        continue
                     if resource["state"] == "verified":
                         continue
-                    if not (asset.get("download_attempted") or asset.get("download_status") == "ok"):
-                        continue          # 还没尝试过下载，不算「无法找回」
+                    if not (asset.get("download_attempted") or asset.get("download_status") == "ok"
+                            or (self.config.download_images and asset.get("downloadable"))):
+                        continue
+                    if source is None:
+                        folder = self.config.item_dir(key)
+                        metadata = read_json(folder / 'metadata.json', {}) or {}
+                        base_url = metadata.get('iframe_url_original') or metadata.get('detail_url')
+                        source = current_content_path(folder, prefer_local=False).read_text(encoding='utf-8')
                     entry = {
-                        "url": asset.get("original_url"),
+                        "id": asset["id"],
+                        "url": redact_url(asset.get("original_url") or ""),
                         "domain": asset.get("domain") or "",
                         "reason": _plain_failure({**asset, "validation_reason": resource["reason"]}),
+                        "retryable": bool(image_retry_urls(source, base_url, asset, resource["reason"])),
                     }
                     # 字节已下载、结构也合法，却被识别为占位图 = 百度删了原图
-                    is_placeholder = resource["reason"] == "invalid_media_placeholder" or "placeholder" in (asset.get("error") or "")
+                    is_placeholder = is_source_placeholder(asset, resource["reason"])
                     (deleted if is_placeholder else dead).append(entry)
                 if deleted:
                     groups["baidu_deleted"].append({**base, "images": deleted})
                 if dead:
                     groups["dead_images"].append({**base, "images": dead})
+                if unverified:
+                    groups["unverified"].append({**base, "images": unverified})
+                if embeds:
+                    groups["external_embeds"].append({**base, "images": embeds})
         return groups
 
     def get_images(self) -> list[dict[str, Any]]:
@@ -803,10 +869,11 @@ class Api:
         return out
 
     def get_thumbnail(self, asset_id: int, size: int = 320) -> str | None:
-        """生成缩略图（data URI）。只用校验通过的字节；结果缓存在内存里。"""
-        cache = self.__dict__.setdefault("_thumbs", {})
-        if asset_id in cache:
-            return cache[asset_id]
+        """从已校验字节生成缩略图，缓存按内容和尺寸区分且限制内存占用。"""
+        if (type(asset_id) is not int or asset_id <= 0 or type(size) is not int or size <= 0
+                or not self.config.db_path.exists()):
+            return None
+        size = min(size, THUMBNAIL_MAX_SIZE)
         import base64
         import io
 
@@ -815,31 +882,42 @@ class Api:
         from .truth import validate_downloaded_asset
 
         with ArchiveState(self.config.db_path) as state:
-            asset = next((a for a in state.all_assets() if a["id"] == asset_id), None)
-            if not asset or not validate_downloaded_asset(self.config, asset)["ok"]:
-                return None
-            path = self.config.item_dir(asset["key"]) / asset["local_path"]
+            asset = state.get_asset(asset_id)
+        validation = (validate_downloaded_asset(self.config, asset)
+                      if asset and asset.get('kind') == 'image' else {'ok': False})
+        # 即使缓存命中，也必须先核对当前资源关系和磁盘字节。
+        if not validation['ok']:
+            with self._thumb_lock:
+                for key in list(self._thumbs):
+                    if key[0] == asset_id:
+                        del self._thumbs[key]
+            return None
+        cache_key = (asset_id, size, asset['sha256'], asset.get('content_type'), validation['path'].suffix)
+        with self._thumb_lock:
+            if cache_key in self._thumbs:
+                self._thumbs.move_to_end(cache_key)
+                return self._thumbs[cache_key]
+        body = validation['body']
         try:
-            with Image.open(path) as image:
+            with Image.open(io.BytesIO(body)) as image:
                 image.thumbnail((size, size))
                 if image.mode not in ("RGB", "L"):
                     image = image.convert("RGB")
                 buffer = io.BytesIO()
                 image.save(buffer, "JPEG", quality=82)
+            result = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode('ascii')
         except Exception:  # noqa: BLE001 —— GIF/SVG 等无法缩略时退回原图
-            try:
-                import mimetypes
-                body = path.read_bytes()
-                if len(body) > 2 * 1024 * 1024:
-                    return None
-                mime = mimetypes.guess_type(path.name)[0] or "image/png"
-                result = f"data:{mime};base64," + base64.b64encode(body).decode()
-                cache[asset_id] = result
-                return result
-            except OSError:
+            import mimetypes
+            if len(body) > 2 * 1024 * 1024:
                 return None
-        result = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
-        cache[asset_id] = result
+            mime = mimetypes.guess_type(validation['path'].name)[0] or "image/png"
+            result = f"data:{mime};base64," + base64.b64encode(body).decode('ascii')
+        with self._thumb_lock:
+            self._thumbs[cache_key] = result
+            self._thumbs.move_to_end(cache_key)
+            while (len(self._thumbs) > THUMBNAIL_CACHE_ENTRIES
+                   or sum(len(value) for value in self._thumbs.values()) > THUMBNAIL_CACHE_BYTES):
+                self._thumbs.popitem(last=False)
         return result
 
     def reset_recommended_settings(self) -> dict[str, Any]:
@@ -902,10 +980,14 @@ class Api:
         self.config.root.mkdir(parents=True, exist_ok=True)
         _reveal(self.config.root.resolve())
 
+    def get_theme(self) -> str:
+        mode = _load_prefs().get("theme")
+        return mode if mode in ("light", "dark", "system") else "system"
+
     def set_theme(self, mode: str) -> None:
-        prefs = _load_prefs()
-        prefs["theme"] = mode
-        _save_prefs(prefs)
+        if mode not in ("light", "dark", "system"):
+            return
+        _update_prefs(theme=mode)
 
 
 def _build_menu(api: Api) -> list:
@@ -955,16 +1037,15 @@ def launch(config: Config | None = None, *, debug: bool = False) -> None:
 
     def remember_geometry(*_args: Any) -> None:
         try:
-            saved = _load_prefs()
-            saved.update({"width": window.width, "height": window.height})
-            _save_prefs(saved)
+            _update_prefs(width=window.width, height=window.height)
         except Exception:  # noqa: BLE001
             pass
 
     window.events.resized += remember_geometry
     window.events.closing += remember_geometry
 
-    webview.start(menu=_build_menu(api), debug=debug)
+    icon_name = {"darwin": "icon.icns", "win32": "icon.ico"}.get(sys.platform, "icon.png")
+    webview.start(menu=_build_menu(api), debug=debug, icon=str(UI_DIR / icon_name))
 
 
 if __name__ == "__main__":  # pragma: no cover

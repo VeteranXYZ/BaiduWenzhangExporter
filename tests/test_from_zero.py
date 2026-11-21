@@ -110,7 +110,7 @@ def test_from_zero_needs_no_offline_repair_and_exports(fresh_app, monkeypatch, t
     monkeypatch.setattr(gui, '_notify', lambda *a: None); monkeypatch.setattr(gui, '_reveal', lambda *a: None)
     result = api.export_all()
     assert result['ok'] and result['articles'] == len(KEYS) and not result['warnings']
-    assert len(list(Path(result['path']).rglob('*.png'))) == len(KEYS)
+    assert len(list((Path(result['path']) / 'articles').glob('*/assets/*.png'))) == len(KEYS)
 
 
 def test_download_resumes_after_stop_without_refetching_saved_articles(fresh_app, monkeypatch):

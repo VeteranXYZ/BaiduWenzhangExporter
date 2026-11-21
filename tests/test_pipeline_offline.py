@@ -173,6 +173,10 @@ def test_export_site_is_browsable_offline(seeded):
     assert count == 1
     index = (site / "index.html").read_text(encoding="utf-8")
     assert 'src="archive-data.js"' in index
+    assert 'href="brand.css"' in index and 'src="icon.png"' in index
+    brand = Path(__file__).parents[1] / "baidu_archive" / "ui"
+    for filename in ("brand.css", "icon.png"):
+        assert (site / filename).read_bytes() == (brand / filename).read_bytes()
     data = (site / "archive-data.js").read_text(encoding="utf-8")
     assert "示例文章标题" in data
     assert "2011" in data                       # 按年份筛选
@@ -185,6 +189,7 @@ def test_export_site_is_browsable_offline(seeded):
     assert "示例文章标题" in page and "返回目录" in page
     assert 'href="../../index.html"' in page
     assert 'href="../../style.css"' in page
+    assert 'href="../../brand.css"' in page and 'href="../../icon.png"' in page
 
 
 def test_export_site_copies_assets_for_portability(seeded):

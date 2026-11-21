@@ -9,9 +9,11 @@
 from __future__ import annotations
 
 import html as html_module
+import re
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -20,7 +22,7 @@ from .config import Config
 from .media import validate_media_response
 # 转发导出：本模块不直接使用，但外部（含测试）从 assets 导入它。
 from .media import image_extension as image_extension
-from .truth import article_truth, index_truth, resource_fingerprint, resource_identity, validate_downloaded_asset
+from .truth import article_truth, index_truth, is_source_placeholder, resource_fingerprint, resource_identity, validate_downloaded_asset
 from uuid import uuid4
 from .parsers import extract_assets, make_soup, parse_srcset
 from .state import ArchiveState
@@ -177,6 +179,218 @@ def localize_html(content_html: str, mapping: dict[str, str]) -> str:
     return str(soup)
 
 
+def _write_localized_article(config, state, key, item, content_html, want_media, log):
+    """Refresh the derived reading copy from the current verified resource set."""
+    item_dir = config.item_dir(key)
+    # ---- 重写本地版 + manifest ----
+    refreshed = state.assets_for(key)
+    usable = {a['id'] for a in refreshed if validate_downloaded_asset(config, a)['ok']}
+    mapping = {a['original_url']: a['local_path'] for a in refreshed if a['id'] in usable}
+    for a in refreshed:
+        if a['id'] in usable and a.get('resolved_url'):
+            mapping.setdefault(a['resolved_url'], a['local_path'])
+    metadata = read_json(item_dir / 'metadata.json', {}) or {}
+    fingerprint = resource_fingerprint(metadata.get('parsed_sha256'),
+                                       metadata.get('iframe_url_original'), refreshed)
+
+    localized_sha = write_text_atomic(item_dir / "content.local.html", localize_html(content_html, mapping))
+
+    manifest = []
+    for a in refreshed:
+        manifest.append(
+            {
+                "original_url": a["original_url"],
+                "resolved_url": a["resolved_url"],
+                "redacted_url": redact_url(a["resolved_url"] or a["original_url"] or ""),
+                "kind": a["kind"],
+                "element_type": a["element_type"],
+                "attribute": a["attribute"],
+                "scheme_kind": a["scheme_kind"],
+                "domain": a["domain"],
+                "download_attempted": bool(a["download_attempted"]),
+                "download_status": a["download_status"],
+                "http_status": a["http_status"],
+                "content_type": a["content_type"],
+                "local_path": a["local_path"],
+                "sha256": a["sha256"],
+                "size": a["size"],
+                "error": a["error"],
+            }
+        )
+    write_json_atomic(item_dir / "asset_manifest.json", {
+        "key": key,
+        "generated_at": utcnow_iso(),
+        "count": len(manifest),
+        "downloaded": len(usable),
+        "assets": manifest,
+    })
+
+    downloadable_refs = {(a['original_url'], a['attribute']) for a in refreshed if a.get('downloadable')}
+    expected = [m for m in manifest if m['download_attempted'] or
+                ((m['original_url'], m['attribute']) in downloadable_refs and (
+                (m['kind'] == 'image' and config.download_images and m['resolved_url']) or
+                (want_media and m['kind'] not in {'image', 'link'} and m['resolved_url'])))]
+    verified_refs = {(a["original_url"], a["attribute"]) for a in refreshed if a["id"] in usable}
+    failed_here = [m for m in expected if (m["original_url"], m["attribute"]) not in verified_refs]
+    final_status = "assets_partial" if failed_here else ("warning" if item.get("warning") else "complete")
+    index = index_truth(state)
+    if final_status == 'complete' and (not metadata.get('parsed_sha256') or not index['ok'] or key not in index['seen_keys']):
+        final_status = 'parsed'
+
+    # 同步进 metadata.json
+    metadata_path = item_dir / "metadata.json"
+    if metadata_path.exists():
+        import json as _json
+
+        try:
+            metadata = _json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, _json.JSONDecodeError):
+            metadata = None
+        if metadata is not None:
+            metadata["assets"] = manifest
+            metadata["asset_count_downloaded"] = len(usable)
+            metadata["localized_from_sha256"] = metadata.get("parsed_sha256")
+            metadata["localized_sha256"] = localized_sha
+            metadata['localization_version'] = LOCALIZATION_VERSION
+            metadata['resource_fingerprint'] = fingerprint
+            metadata['localized_resource_fingerprint'] = fingerprint
+            metadata['include_media'] = want_media or metadata.get('include_media', False)
+            metadata["status"] = final_status
+            write_json_atomic(metadata_path, metadata)
+
+    if failed_here:
+        state.update_item(key, status="assets_partial", assets_done_at=utcnow_iso())
+        log("ASSET", f"key={key} {len(expected)-len(failed_here)}/{len(expected)} 下载成功（部分失败）")
+    else:
+        if item.get("warning"):
+            state.update_item(key, status="warning", assets_done_at=utcnow_iso())
+        else:
+            state.update_item(key, status=final_status, assets_done_at=utcnow_iso())
+        if expected:
+            log("ASSET", f"key={key} {len(expected)}/{len(expected)} 全部下载成功")
+
+
+def image_retry_urls(content: str, base_url: str | None, asset: dict, reason: str) -> list[str]:
+    """Use only the original URL and explicit alternatives on the same image."""
+    original = asset.get('resolved_url')
+    if not original or not asset.get('downloadable') or reason in {'legacy_unverified', 'asset_path_outside_item'}:
+        return []
+    try:
+        host = urlparse(original).hostname
+    except ValueError:
+        return []
+    if not host:
+        return []
+    alternatives = []
+
+    def same_host_url(value):
+        try:
+            url = urljoin(base_url or original, html_module.unescape(str(value or '')).strip())
+            parts = urlparse(url)
+            if parts.scheme in ('http', 'https') and parts.hostname == host and not parts.username:
+                return url
+        except ValueError:
+            pass
+        return None
+
+    def candidates(node):
+        return [node.get(attr) for attr in ('src', 'data-src', 'data-original', 'data-lazy-src')] + [
+            url for url, _ in parse_srcset(str(node.get('srcset') or ''))]
+
+    for img in make_soup(content).find_all('img'):
+        picture = img.find_parent('picture')
+        values = candidates(img)
+        if picture:
+            values.extend(value for source in picture.find_all('source') for value in candidates(source))
+        if original not in {same_host_url(value) for value in values if value}:
+            continue
+        anchor = img.find_parent('a', href=True)
+        if anchor:
+            linked = same_host_url(anchor['href'])
+            if linked and re.search(r'\.(?:jpe?g|png|gif|bmp|webp|avif)(?:$|[?&#])', linked, re.I):
+                alternatives.append(linked)
+        alternatives.extend(url for value in values if value and (url := same_host_url(value)))
+    # Do not repeatedly ask for a URL that already returned the same known placeholder.
+    if is_source_placeholder(asset, reason):
+        alternatives = [url for url in alternatives if url != original]
+    elif same_host_url(original):
+        alternatives.insert(0, original)
+    return list(dict.fromkeys(alternatives))[:3]
+
+
+def retry_missing_images(config: Config, state: ArchiveState, client: ArchiveClient, *,
+                         asset_ids: list[int], log: Logger = _noop) -> dict:
+    """Update only requested active images, preserving old bytes and download evidence."""
+    control = getattr(client, 'control', None) or TaskControl()
+    counts = {'recovered': 0, 'failed': 0, 'skipped': 0}
+    touched = {}
+    sources = {}
+    try:
+        for position, asset_id in enumerate(asset_ids, 1):
+            control.check()
+            asset = state.get_asset(asset_id)
+            if not asset or asset['kind'] != 'image':
+                counts['skipped'] += 1
+                continue
+            validation = validate_downloaded_asset(config, asset)
+            if validation['ok']:
+                counts['skipped'] += 1
+                continue
+            key = asset['key']
+            folder = config.item_dir(key)
+            if key not in sources:
+                facts = article_truth(config, state, key)
+                if not facts['available'] or any(
+                    issue == 'resource_generation_mismatch'
+                    or (issue.startswith(('stale_', 'invalid_')) and issue.endswith(('_generation', '_snapshot')))
+                    for issue in facts['issues']
+                ):
+                    sources[key] = None
+                else:
+                    meta = read_json(folder / 'metadata.json', {}) or {}
+                    sources[key] = (current_content_path(folder, prefer_local=False).read_text(encoding='utf-8'), meta)
+            if sources[key] is None:
+                counts['skipped'] += 1
+                continue
+            content, meta = sources[key]
+            urls = image_retry_urls(content, meta.get('iframe_url_original') or meta.get('detail_url'),
+                                    asset, validation['reason'])
+            if not urls:
+                counts['skipped'] += 1
+                continue
+            folder.joinpath('assets').mkdir(parents=True, exist_ok=True)
+            log('ASSET', f'{position}/{len(asset_ids)} 正在核对指定图片')
+            for url in urls:
+                control.check()
+                result = _download_one(client, config, {**asset, 'resolved_url': url}, folder / 'assets', asset_id)
+                ok = result.get('download_status') == 'ok'
+                write_json_atomic(
+                    config.raw_dir / 'image_recovery' / safe_key_dirname(key) / f'{uuid4().hex}.json',
+                    {'id': asset_id, 'at': utcnow_iso(), 'original_url': redact_url(asset['resolved_url']),
+                     'attempted_url': redact_url(url), 'result': result},
+                )
+                if ok:
+                    result['download_identity'] = resource_identity(asset)
+                    state.record_asset_result(key, asset['original_url'], asset['attribute'], **result)
+                    touched[key] = (content, meta.get('include_media', False))
+                    counts['recovered'] += 1
+                    break
+                if asset.get('download_status') != 'ok':
+                    state.record_asset_result(key, asset['original_url'], asset['attribute'], **result)
+                state.record_failure(key, 'image_retry', url_redacted=redact_url(url),
+                                     http_status=result.get('http_status'), error=result.get('error'))
+            else:
+                counts['failed'] += 1
+    finally:
+        for key, (content, include_media) in touched.items():
+            _write_localized_article(config, state, key, state.get_item(key) or {}, content, include_media, _noop_log)
+    return counts
+
+
+def _noop_log(*_args):
+    pass
+
+
 def run_assets(
     config: Config,
     state: ArchiveState,
@@ -325,92 +539,7 @@ def run_assets(
             break
         control.check()
 
-        # ---- 重写本地版 + manifest ----
-        refreshed = state.assets_for(key)
-        mapping = {
-            a["original_url"]: a["local_path"]
-            for a in refreshed
-            if validate_downloaded_asset(config, a)['ok']
-        }
-        # resolved_url 与 original_url 不同时（相对路径），两个键都要能命中
-        for a in refreshed:
-            if validate_downloaded_asset(config, a)['ok'] and a.get("resolved_url"):
-                mapping.setdefault(a["resolved_url"], a["local_path"])
-
-        localized_sha = write_text_atomic(item_dir / "content.local.html", localize_html(content_html, mapping))
-
-        manifest = []
-        for a in refreshed:
-            manifest.append(
-                {
-                    "original_url": a["original_url"],
-                    "resolved_url": a["resolved_url"],
-                    "redacted_url": redact_url(a["resolved_url"] or a["original_url"] or ""),
-                    "kind": a["kind"],
-                    "element_type": a["element_type"],
-                    "attribute": a["attribute"],
-                    "scheme_kind": a["scheme_kind"],
-                    "domain": a["domain"],
-                    "download_attempted": bool(a["download_attempted"]),
-                    "download_status": a["download_status"],
-                    "http_status": a["http_status"],
-                    "content_type": a["content_type"],
-                    "local_path": a["local_path"],
-                    "sha256": a["sha256"],
-                    "size": a["size"],
-                    "error": a["error"],
-                }
-            )
-        write_json_atomic(item_dir / "asset_manifest.json", {
-            "key": key,
-            "generated_at": utcnow_iso(),
-            "count": len(manifest),
-            "downloaded": sum(1 for m in manifest if m["download_status"] == "ok"),
-            "assets": manifest,
-        })
-
-        downloadable_refs = {(a['original_url'], a['attribute']) for a in refreshed if a.get('downloadable')}
-        expected = [m for m in manifest if m['download_attempted'] or
-                    ((m['original_url'], m['attribute']) in downloadable_refs and (
-                    (m['kind'] == 'image' and config.download_images and m['resolved_url']) or
-                    (want_media and m['kind'] not in {'image', 'link'} and m['resolved_url'])))]
-        failed_here = [m for m in expected if m["download_status"] != "ok"]
-        final_status = "assets_partial" if failed_here else ("warning" if item.get("warning") else "complete")
-        index = index_truth(state)
-        if final_status == 'complete' and (not metadata.get('parsed_sha256') or not index['ok'] or key not in index['seen_keys']):
-            final_status = 'parsed'
-
-        # 同步进 metadata.json
-        metadata_path = item_dir / "metadata.json"
-        if metadata_path.exists():
-            import json as _json
-
-            try:
-                metadata = _json.loads(metadata_path.read_text(encoding="utf-8"))
-            except (OSError, _json.JSONDecodeError):
-                metadata = None
-            if metadata is not None:
-                metadata["assets"] = manifest
-                metadata["asset_count_downloaded"] = sum(1 for m in manifest if m["download_status"] == "ok")
-                metadata["localized_from_sha256"] = metadata.get("parsed_sha256")
-                metadata["localized_sha256"] = localized_sha
-                metadata['localization_version'] = LOCALIZATION_VERSION
-                metadata['resource_fingerprint'] = fingerprint
-                metadata['localized_resource_fingerprint'] = fingerprint
-                metadata['include_media'] = want_media or metadata.get('include_media', False)
-                metadata["status"] = final_status
-                write_json_atomic(metadata_path, metadata)
-
-        if failed_here:
-            state.update_item(key, status="assets_partial", assets_done_at=utcnow_iso())
-            log("ASSET", f"key={key} {len(expected)-len(failed_here)}/{len(expected)} 下载成功（部分失败）")
-        else:
-            if item.get("warning"):
-                state.update_item(key, status="warning", assets_done_at=utcnow_iso())
-            else:
-                state.update_item(key, status=final_status, assets_done_at=utcnow_iso())
-            if expected:
-                log("ASSET", f"key={key} {len(expected)}/{len(expected)} 全部下载成功")
+        _write_localized_article(config, state, key, item, content_html, want_media, log)
 
     if aborted:
         log("AUTH", aborted)

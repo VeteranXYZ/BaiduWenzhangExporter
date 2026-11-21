@@ -34,6 +34,64 @@ def test_cookie_header_tolerates_empty_and_pairs():
     assert cookie_header_from([("A", "1"), ("B", "2")]) == "A=1; B=2"
 
 
+def test_login_helpers_import_without_optional_gui_dependency():
+    import subprocess
+    import sys
+
+    script = '''
+import sys
+sys.modules['webview'] = None
+from baidu_archive.login import cookie_header_from, default_list_url_template, open_login_window
+from baidu_archive.config import Config
+assert cookie_header_from([('BDUSS', 'FAKE')]) == 'BDUSS=FAKE'
+assert '/fav/list' in default_list_url_template(Config())
+try:
+    open_login_window(Config())
+except ModuleNotFoundError as exc:
+    assert exc.name == 'webview'
+else:
+    raise AssertionError('GUI should require pywebview')
+'''
+    subprocess.run([sys.executable, '-c', script], check=True, capture_output=True, text=True)
+
+
+@pytest.mark.parametrize('current_url, trusted', [
+    ('https://wenzhang.baidu.com/', True),
+    ('https://wenzhang.baidu.com:443/', True),
+    ('http://wenzhang.baidu.com/', False),
+    ('https://wenzhang.baidu.com:8443/', False),
+    ('https://example.test/', False),
+])
+def test_login_window_reads_cookies_only_on_expected_origin(monkeypatch, current_url, trusted):
+    import sys
+    from types import SimpleNamespace
+
+    from baidu_archive import login
+
+    class Event:
+        def __iadd__(self, callback):
+            self.callback = callback
+            return self
+
+    reads = []
+    saved = []
+
+    def cookies():
+        reads.append(True)
+        return [_cookie('BDUSS', 'FAKE')]
+
+    window = SimpleNamespace(events=SimpleNamespace(loaded=Event(), closed=Event()),
+                             get_current_url=lambda: current_url, get_cookies=cookies,
+                             destroy=lambda: None)
+    monkeypatch.setitem(sys.modules, 'webview', SimpleNamespace(create_window=lambda *a, **kw: window))
+    monkeypatch.setattr(login, 'save_cookie_session', lambda *a, **kw: saved.append(True) or {})
+    results = []
+    login.open_login_window(Config(), on_result=results.append)
+    window.events.loaded.callback()
+    assert reads == saved == ([True] if trusted else [])
+    assert results == ([{'ok': True}] if trusted else [])
+
+
 # ---------------- 凭证落盘 ----------------
 
 def test_save_cookie_session_rejects_without_bduss(tmp_path):

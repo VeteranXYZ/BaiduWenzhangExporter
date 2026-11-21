@@ -426,8 +426,10 @@ def test_reading_views_do_not_reuse_stale_local_references(archive):
     (cfg.item_dir('one') / asset['local_path']).unlink()
     site = cfg.root.parent / 'reading'
     export_site(cfg, state, site)
-    node = make_soup((site / 'articles' / 'one' / 'index.html').read_text()).img
-    assert not node['src'].startswith('assets/')
+    content = make_soup((site / 'articles' / 'one' / 'index.html').read_text()).article
+    assert not content.img
+    marker = content.select_one('[data-archive-unavailable="image"]')
+    assert '图片未保存' in marker.get_text() and marker.a['href'].endswith('/photo.png')
     node = make_soup(server.Application(cfg).article('one').decode()).img
     assert not node.has_attr('src')
     assert (cfg.item_dir('one') / 'content.local.html').read_bytes() == saved_local
@@ -519,6 +521,36 @@ def test_gui_library_reuses_server_application(archive, monkeypatch):
     assert data['summary']['downloaded'] == 1
 
 
+def test_other_bookmarks_keep_a_safe_open_action_in_both_readers(archive, monkeypatch, tmp_path):
+    import webbrowser
+
+    from baidu_archive.site import export_reading_site
+
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    url = 'https://example.test/old-post?id=42'
+    state.upsert_record({'key': 'bookmark', 'type': 'article', 'external_url': url})
+    state.upsert_record({'key': 'unsafe', 'type': 'other', 'external_url': 'javascript:alert(1)'})
+    state.upsert_record({'key': 'private', 'type': 'other', 'external_url': 'https://example.test/?token=secret'})
+    opened = []
+    monkeypatch.setattr(webbrowser, 'open', lambda address, new: opened.append(address) or True)
+    api = gui.Api(cfg)
+    records = {record['key']: record for record in api.get_library()['records']}
+    assert records['bookmark']['bookmark_available'] and not records['bookmark']['available']
+    assert not records['unsafe']['bookmark_available'] and not records['private']['bookmark_available']
+    assert api.open_bookmark('bookmark')
+    assert not any(api.open_bookmark(key) for key in ['one', 'unsafe', 'private', 'unknown'])
+    assert opened == [url]
+
+    site = tmp_path / 'site'
+    export_reading_site(cfg, state, site)
+    script = (site / 'archive-data.js').read_text(encoding='utf-8')
+    payload = json.loads(script[len('window.ARCHIVE_DATA = '):-2])
+    assert {entry['key']: entry['bookmark_url'] for entry in payload['entries']} == {
+        'one': None, 'bookmark': url, 'unsafe': None, 'private': None,
+    }
+
+
 def test_gui_article_inlines_only_validated_bytes(archive, monkeypatch):
     """预览把图片内联成 data URI；字节一旦损坏就必须降级为占位，不能照样显示。"""
     gui = _gui(monkeypatch)
@@ -541,6 +573,19 @@ def test_gui_article_rejects_unknown_key(archive, monkeypatch):
     gui = _gui(monkeypatch)
     cfg, state = archive
     assert 'error' in gui.Api(cfg).get_article('没有这个 key')
+
+
+def test_gui_article_inlines_validated_media_source(archive, monkeypatch):
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    raw_article(cfg, 'one', '<audio controls><source src="tone.wav" type="audio/wav"></audio>')
+    run_parse(cfg, state, force=True)
+    download(cfg, state, body=(FIXTURES / 'tiny.wav').read_bytes(), mime='audio/wav', include_media=True)
+    api = gui.Api(cfg)
+    result = api.get_article('one')
+    assert result['images_inlined'] == 1
+    assert make_soup(result['html']).find('source')['src'].startswith('data:audio/')
+    assert api.get_thumbnail(state.assets_for('one')[0]['id']) is None
 
 
 def test_gui_export_cancelled_when_no_directory_chosen(archive, monkeypatch):
@@ -583,6 +628,42 @@ def test_gui_export_selection_with_real_archive(archive, monkeypatch, tmp_path):
     assert any(n.endswith('.md') for n in names) and any(n.endswith('.txt') for n in names)
 
 
+def test_gui_exports_saved_text_when_other_articles_are_pending(archive, monkeypatch, tmp_path):
+    import zipfile
+    from baidu_archive.utils import safe_key_dirname
+
+    cfg, state = archive
+    state.upsert_record({'key': 'pending', 'type': 'page', 'title': '尚未下载', 'global_position': 1})
+    api = _export_all(monkeypatch, cfg, tmp_path)
+
+    def exported_keys(path):
+        with zipfile.ZipFile(path) as bundle:
+            return [entry['key'] for entry in json.loads(bundle.read('manifest.json'))['entries']]
+
+    text = api.export_to('selection', [])
+    assert text['ok'], text.get('error')
+    assert exported_keys(text['path']) == ['one']
+    backup = api.export_all()
+    assert backup['ok'] and backup['articles'] == 1 and not backup['warnings']
+    assert exported_keys(Path(backup['path']) / '文本版-Markdown与TXT.zip') == ['one']
+    assert not (Path(backup['path']) / 'articles' / safe_key_dirname('pending')).exists()
+
+
+def test_gui_persists_theme_without_overwriting_window_preferences(tmp_path, monkeypatch):
+    gui = _gui(monkeypatch)
+    prefs = tmp_path / 'window.json'
+    prefs.write_text('{"width": 1180, "height": 780}', encoding='utf-8')
+    monkeypatch.setattr(gui, '_prefs_path', lambda: prefs)
+    api = gui.Api(Config(root=tmp_path / 'archive'))
+    assert api.get_theme() == 'system'
+    api.set_theme('dark')
+    assert gui.Api(api.config).get_theme() == 'dark'
+    api.set_theme('invalid')
+    assert read_json(prefs) == {'width': 1180, 'height': 780, 'theme': 'dark'}
+    api.set_theme('system')
+    assert gui.Api(api.config).get_theme() == 'system'
+
+
 def _export_all(monkeypatch, cfg, target):
     gui = _gui(monkeypatch)
     api = gui.Api(cfg)
@@ -607,6 +688,74 @@ def test_gui_export_all_builds_complete_offline_package(archive, monkeypatch, tm
     article = next((package / 'articles').iterdir())
     assert list(article.rglob('*.png'))
     assert 'assets/' in (article / 'index.html').read_text(encoding='utf-8')
+    from zipfile import ZipFile
+    from baidu_archive.utils import sha256_bytes
+
+    resources = json.loads((package / '缺失与资源清单.json').read_text())
+    assert resources['missing'] == []
+    assert (package / resources['included'][0]['path']).is_file()
+    with ZipFile(package / '原始文件与版本.zip') as originals:
+        archived = originals.read('items/one/content.original.html')
+        assert archived == (cfg.item_dir('one') / 'content.original.html').read_bytes()
+        assert 'state.db' in originals.namelist()
+        manifest = json.loads(originals.read('manifest.json'))
+        assert all(sha256_bytes(originals.read(f['path'])) == f['sha256'] for f in manifest['files'])
+
+
+def test_desktop_retries_only_explicit_missing_image_ids(archive, monkeypatch):
+    from PIL import Image
+    from baidu_archive.media import KNOWN_PLACEHOLDERS
+    from baidu_archive.utils import sha256_bytes
+
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    raw_article(cfg, 'one', '<p>正文</p><img src="good.png">'
+                '<a href="replacement.png"><img src="gone.png"></a><img src="unselected.png">')
+    run_parse(cfg, state, force=True)
+    placeholder = io.BytesIO()
+    Image.new('RGB', (4, 4), 'white').save(placeholder, format='PNG')
+    placeholder_bytes = placeholder.getvalue()
+    digest = sha256_bytes(placeholder_bytes)
+    monkeypatch.setitem(KNOWN_PLACEHOLDERS, digest, 'placeholder')
+
+    def initial(request):
+        name = request.url.path.rsplit('/', 1)[-1]
+        if name == 'good.png':
+            return httpx.Response(200, content=PNG, headers={'Content-Type': 'image/png'})
+        return httpx.Response(503)
+
+    with transport(cfg, initial) as client:
+        run_assets(cfg, state, client)
+    rows = {a['original_url']: a for a in state.assets_for('one')}
+    old_file = cfg.item_dir('one') / 'assets' / 'old-placeholder.png'
+    old_file.write_bytes(placeholder_bytes)
+    state.record_asset_result('one', 'gone.png', 'src', download_status='ok',
+                              local_path='assets/old-placeholder.png', sha256=digest, size=len(placeholder_bytes))
+    original = (cfg.item_dir('one') / 'content.original.html').read_bytes()
+    requests = []
+
+    def retry_response(request):
+        requests.append(request.url.path)
+        return httpx.Response(200, content=PNG, headers={'Content-Type': 'image/png'})
+
+    monkeypatch.setattr(server, 'load_credentials', lambda: Credentials())
+    monkeypatch.setattr(server, 'ArchiveClient', lambda config, credentials, **kwargs:
+                        transport(config, retry_response, kwargs.get('control')))
+    api = gui.Api(cfg)
+    alternatives = api.get_problems()['baidu_deleted'][0]['images']
+    assert [(a['id'], a['retryable']) for a in alternatives] == [(rows['gone.png']['id'], True)]
+    started = api.retry_images([rows['gone.png']['id'], rows['good.png']['id'], rows['gone.png']['id']])
+    assert started['ok'], started
+    api._app().thread.join(5)
+    assert not api._app().thread.is_alive()
+    assert requests == ['/old/replacement.png']
+    assert api.get_task()['result'] == {'recovered': 1, 'failed': 0, 'skipped': 1}
+    assert validate_downloaded_asset(cfg, state.get_asset(rows['gone.png']['id']))['ok']
+    assert state.get_asset(rows['unselected.png']['id']) == rows['unselected.png']
+    assert state.get_asset(rows['good.png']['id']) == rows['good.png']
+    assert 'data-archive-original-src="gone.png"' in (cfg.item_dir('one') / 'content.local.html').read_text()
+    assert old_file.read_bytes() == placeholder_bytes
+    assert (cfg.item_dir('one') / 'content.original.html').read_bytes() == original
 
 
 def test_gui_export_all_never_overwrites_and_leaves_no_partial(archive, monkeypatch, tmp_path):
@@ -618,6 +767,18 @@ def test_gui_export_all_never_overwrites_and_leaves_no_partial(archive, monkeypa
     assert not [p for p in tmp_path.iterdir() if p.name.startswith('.')]   # 无 .partial 残留
 
 
+def test_gui_exports_directly_to_its_local_archive_directory(archive, monkeypatch, tmp_path):
+    cfg, state = archive
+    download(cfg, state)
+    api = _export_all(monkeypatch, cfg, tmp_path)
+    monkeypatch.setattr(api, 'choose_directory', lambda: pytest.fail('应直接使用归档内的导出目录'))
+    result = api.export_all(True)
+    images = api.export_to('images', [], True)
+    assert result['ok'] and images['ok']
+    assert Path(result['path']).parent == (cfg.root / 'exports').resolve()
+    assert Path(images['path']).parent == (cfg.root / 'exports').resolve()
+
+
 def test_gui_export_all_skips_corrupted_images(archive, monkeypatch, tmp_path):
     """损坏的图片不得打进导出包 —— 包里只放校验通过的字节。"""
     cfg, state = archive
@@ -625,7 +786,15 @@ def test_gui_export_all_skips_corrupted_images(archive, monkeypatch, tmp_path):
     (cfg.item_dir('one') / state.assets_for('one')[0]['local_path']).write_bytes(b'not a png')
     result = _export_all(monkeypatch, cfg, tmp_path).export_all()
     assert result['ok']
-    assert not list(Path(result['path']).rglob('*.png'))
+    package = Path(result['path'])
+    assert not list((package / 'articles').glob('*/assets/*.png'))
+    assert result['missing_resources'] == 1 and not result['warnings']
+    from zipfile import ZipFile
+
+    with ZipFile(package / '文本版-Markdown与TXT.zip') as bundle:
+        assert b'Body' in bundle.read('articles/one/content.txt')
+        manifest = json.loads(bundle.read('manifest.json'))
+        assert manifest['entries'][0]['missing_resources'][0]['status'] == 'failed_integrity'
 
 
 def test_gui_export_all_refuses_while_task_running(archive, monkeypatch, tmp_path):
@@ -738,14 +907,14 @@ def test_problems_group_dead_images_with_plain_reason(archive, monkeypatch):
     groups = gui.Api(cfg).get_problems()
     assert [g['key'] for g in groups['dead_images']] == ['one']
     image = groups['dead_images'][0]['images'][0]
-    assert image['url'] == 'photo.png' and '停止运营' in image['reason']
+    assert image['url'] == 'photo.png' and 'HTTP 504' in image['reason']
     assert groups['not_saved'] == [] and groups['unverified'] == []
 
 
 @pytest.mark.parametrize('asset,expected', [
-    ({'http_status': 404}, '已被删除'),
+    ({'http_status': 404}, '找不到图片'),
     ({'http_status': 403}, '拒绝访问'),
-    ({'http_status': 504}, '停止运营'),
+    ({'http_status': 504}, 'HTTP 504'),
     ({'http_status': 200, 'error': '响应不是可识别的图片；原始响应已保存'}, '网页而不是图片'),
     ({'http_status': None, 'error': 'ConnectError: ...'}, '无法连接'),
 ])
@@ -762,11 +931,150 @@ def test_images_page_lists_only_verified_and_thumbnails_are_bytes_checked(archiv
     assert [i['key'] for i in listed] == ['one']
     thumb = api.get_thumbnail(listed[0]['id'])
     assert thumb and thumb.startswith('data:image/')
-    # 字节损坏后：不再列出，也不再生成缩略图（新建 Api，避免内存缓存）
+    # 同一个窗口中，缓存也不能继续掩盖磁盘上的损坏。
     (cfg.item_dir('one') / state.assets_for('one')[0]['local_path']).write_bytes(b'broken')
-    fresh = gui.Api(cfg)
-    assert fresh.get_images() == []
-    assert fresh.get_thumbnail(listed[0]['id']) is None
+    assert api.get_images() == []
+    assert api.get_thumbnail(listed[0]['id']) is None
+
+
+@pytest.mark.parametrize('change', ['missing', 'inactive', 'failed', 'identity'])
+def test_thumbnail_cache_checks_current_resource_before_reuse(archive, monkeypatch, change):
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    download(cfg, state)
+    asset = state.assets_for('one')[0]
+    api = gui.Api(cfg)
+    assert api.get_thumbnail(asset['id'])
+    if change == 'missing':
+        (cfg.item_dir('one') / asset['local_path']).unlink()
+    elif change == 'inactive':
+        state.set_current_assets('one', [])
+    else:
+        fields = {'download_status': 'failed'} if change == 'failed' else {'download_identity': 'wrong'}
+        state.record_asset_result('one', 'photo.png', 'src', **fields)
+    assert api.get_thumbnail(asset['id']) is None
+
+
+def test_thumbnail_cache_updates_when_download_is_replaced(archive, monkeypatch):
+    import base64
+    from PIL import Image
+
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    download(cfg, state)
+    asset_id = state.assets_for('one')[0]['id']
+    api = gui.Api(cfg)
+    old = api.get_thumbnail(asset_id)
+    replacement = io.BytesIO()
+    Image.new('RGB', (80, 40), 'red').save(replacement, 'PNG')
+    download(cfg, state, body=replacement.getvalue(), force=True)
+    assert state.assets_for('one')[0]['id'] == asset_id
+    current = api.get_thumbnail(asset_id)
+    assert current != old
+    with Image.open(io.BytesIO(base64.b64decode(current.split(',', 1)[1]))) as image:
+        assert image.size == (80, 40)
+
+
+def test_thumbnail_sizes_and_cache_limits(archive, monkeypatch):
+    import base64
+    from PIL import Image
+
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    buffer = io.BytesIO()
+    Image.new('RGB', (160, 80), 'blue').save(buffer, 'PNG')
+    download(cfg, state, body=buffer.getvalue())
+    asset_id = state.assets_for('one')[0]['id']
+    api = gui.Api(cfg)
+    monkeypatch.setattr(gui, 'THUMBNAIL_CACHE_ENTRIES', 2)
+    monkeypatch.setattr(gui, 'THUMBNAIL_MAX_SIZE', 96)
+    # 查询一张缩略图不应载入全库资源记录。
+    monkeypatch.setattr(ArchiveState, 'all_assets', lambda *_: pytest.fail('全库扫描'))
+    real_open = Image.open
+    decoded = []
+    def track_open(*args, **kwargs):
+        decoded.append(1)
+        return real_open(*args, **kwargs)
+    monkeypatch.setattr(Image, 'open', track_open)
+
+    def thumbnail(size):
+        result = api.get_thumbnail(asset_id, size)
+        with real_open(io.BytesIO(base64.b64decode(result.split(',', 1)[1]))) as image:
+            assert image.size == (min(size, 96), min(size, 96) // 2)
+        return result
+
+    thumbnail(32); thumbnail(64)
+    thumbnail(32)                     # 32 成为最近访问，64 应先淘汰
+    count = len(decoded)
+    result = thumbnail(10**9)          # 大尺寸被限制到 96，且不能复用 32 的结果
+    assert len(api._thumbs) == 2
+    after_new_size = len(decoded)
+    assert after_new_size > count
+    thumbnail(32)
+    # 媒体结构验证仍解码图片，但缓存命中应省去一次缩略图生成。
+    cache_hit_decodes = len(decoded) - after_new_size
+    before_miss = len(decoded)
+    thumbnail(64)
+    assert len(decoded) - before_miss == cache_hit_decodes + 1
+    monkeypatch.setattr(gui, 'THUMBNAIL_CACHE_BYTES', len(result) - 1)
+    thumbnail(96)
+    assert sum(len(v) for v in api._thumbs.values()) <= gui.THUMBNAIL_CACHE_BYTES
+
+
+@pytest.mark.parametrize('method', ['get_article', 'get_thumbnail'])
+def test_gui_previews_use_validated_bytes_when_path_changes(archive, monkeypatch, tmp_path, method):
+    import base64
+    from PIL import Image
+    from baidu_archive import truth
+
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    download(cfg, state)
+    asset = state.assets_for('one')[0]
+    target = cfg.item_dir('one') / asset['local_path']
+    outside = tmp_path / 'outside.txt'
+    secret = b'OUTSIDE SECRET'
+    outside.write_bytes(secret)
+    real_validate = truth.validate_downloaded_asset
+    calls = 0
+    def swap_after_validation(config, row, **kwargs):
+        nonlocal calls
+        result = real_validate(config, row, **kwargs)
+        calls += 1
+        # article 先校验本地化正文，再校验要内联的资源。
+        if result['ok'] and calls == (2 if method == 'get_article' else 1):
+            target.unlink()
+            target.symlink_to(outside)
+        return result
+    monkeypatch.setattr(truth, 'validate_downloaded_asset', swap_after_validation)
+    monkeypatch.setattr(gui, 'validate_downloaded_asset', swap_after_validation)
+    api = gui.Api(cfg)
+    if method == 'get_article':
+        result = api.get_article('one')
+        assert result['images_inlined'] == 1
+        src = make_soup(result['html']).find('img')['src']
+        assert base64.b64decode(src.split(',', 1)[1]) == PNG
+    else:
+        src = api.get_thumbnail(asset['id'])
+        assert src.startswith('data:image/jpeg;base64,')
+        with Image.open(io.BytesIO(base64.b64decode(src.split(',', 1)[1]))) as image:
+            image.load()
+    assert base64.b64encode(secret).decode() not in src
+
+
+@pytest.mark.parametrize('size', [0, -1, None, True, '320', 3.5])
+def test_thumbnail_rejects_invalid_sizes(archive, monkeypatch, size):
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    download(cfg, state)
+    assert gui.Api(cfg).get_thumbnail(state.assets_for('one')[0]['id'], size) is None
+
+
+def test_thumbnail_does_not_create_empty_archive(tmp_path, monkeypatch):
+    gui = _gui(monkeypatch)
+    cfg = Config(root=tmp_path / 'empty')
+    assert gui.Api(cfg).get_thumbnail(1) is None
+    assert not cfg.root.exists()
 
 
 def test_health_flags_risky_download_settings(archive, monkeypatch):
@@ -868,6 +1176,46 @@ def test_prepare_archive_on_fresh_install(tmp_path, monkeypatch):
     assert gui.Api(Config(root=tmp_path / 'nothing')).prepare_archive() == {'state': 'empty', 'migrated': False}
 
 
+def test_prepare_archive_backs_up_legacy_schema_before_upgrade(tmp_path, monkeypatch):
+    import sqlite3
+
+    gui = _gui(monkeypatch)
+    cfg = Config(root=tmp_path)
+    with sqlite3.connect(cfg.db_path) as database:
+        database.executescript((FIXTURES / 'legacy_schema.sql').read_text())
+    original = cfg.db_path.read_bytes()
+    api = gui.Api(cfg)
+    assert api.health()['needs_offline_repair']
+    assert cfg.db_path.read_bytes() == original
+    blocked = cfg.root / 'backups'
+    blocked.write_text('Prevent directory creation')
+    result = api.prepare_archive()
+    assert result['state'] == 'error' and not result['migrated']
+    assert '无法备份归档数据库' in result['error']
+    assert cfg.db_path.read_bytes() == original
+    blocked.unlink()
+    result = api.prepare_archive()
+    assert result['state'] == 'ready' and result['migrated']
+    with sqlite3.connect(result['backup']) as backup:
+        assert backup.execute('PRAGMA user_version').fetchone() == (0,)
+        assert backup.execute('PRAGMA quick_check').fetchone() == ('ok',)
+    with sqlite3.connect(cfg.db_path) as database:
+        assert database.execute('PRAGMA user_version').fetchone() == (1,)
+    assert len(list(blocked.glob('*.db'))) == 1
+
+
+def test_failed_snapshot_blocks_evidence_repair_on_current_schema(archive, monkeypatch):
+    gui = _gui(monkeypatch)
+    cfg, state = archive
+    _legacy_archive(cfg, state)
+    before = state.assets_for('one')
+    (cfg.root / 'backups').write_text('Prevent directory creation')
+    result = gui.Api(cfg).prepare_archive()
+    assert result['state'] == 'error' and not result['migrated']
+    assert state.assets_for('one') == before
+    assert state.get_meta('migrated_at') is None
+
+
 def _two_image_legacy_archive(tmp_path, monkeypatch):
     """一篇文章两张图：一张真照片、一张图床占位图；模拟旧版本留下的归档。"""
     import io
@@ -939,12 +1287,9 @@ def test_gui_process_does_not_hold_archive_lock(tmp_path, monkeypatch):
     def fake_launch(config, debug=False):
         with ArchiveLock(config.root):           # 窗口内的任务必须能拿到锁
             acquired.append(True)
-    import baidu_archive.gui as gui_module
+    import sys
+    gui_module = _gui(monkeypatch)
     monkeypatch.setattr(gui_module, 'launch', fake_launch, raising=False)
-    import sys, types
-    if 'webview' not in sys.modules:
-        view = types.ModuleType('webview'); menu = types.ModuleType('webview.menu')
-        menu.Menu = menu.MenuAction = menu.MenuSeparator = object
-        monkeypatch.setitem(sys.modules, 'webview', view); monkeypatch.setitem(sys.modules, 'webview.menu', menu)
+    monkeypatch.setitem(sys.modules, 'baidu_archive.gui', gui_module)
     assert cli.main(['--root', str(tmp_path / 'archive'), 'gui']) == 0
     assert acquired == [True]

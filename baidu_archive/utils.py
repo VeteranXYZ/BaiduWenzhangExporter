@@ -86,6 +86,23 @@ def redact_url(url: str, extra_keys: Iterable[str] = ()) -> str:
     return urlunparse(parts._replace(query=urlencode(redacted, safe="<>{}")))
 
 
+def bookmark_url(record: dict) -> str | None:
+    """Return the stored public destination for a non-article bookmark."""
+    if record['type'] == 'page':
+        return None
+    for url in (record.get('external_url'), record.get('detail_url')):
+        if not url or '\\' in url or any(ord(char) <= 32 or ord(char) == 127 for char in url):
+            continue
+        try:
+            parts = urlparse(url)
+            if (parts.scheme in {'http', 'https'} and parts.hostname and parts.username is None
+                    and not any(key.lower() in SENSITIVE_QUERY_KEYS for key, _ in parse_qsl(parts.query))):
+                return url
+        except ValueError:
+            continue
+    return None
+
+
 def redact_cookie(cookie_header: str) -> str:
     """把 Cookie header 压缩成 ``name=<redacted>`` 形式，只暴露 cookie 名。"""
     if not cookie_header:

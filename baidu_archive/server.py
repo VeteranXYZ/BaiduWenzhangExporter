@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from uuid import uuid4
 
-from .assets import run_assets
+from .assets import retry_missing_images, run_assets
 from .auth import AuthError, import_curl, load_credentials, parse_curl
 from .client import ArchiveClient, AuthExpired
 from .config import Config
@@ -26,17 +26,18 @@ from .site import reading_html
 from .state import ArchiveState
 from .storage import IntegrityError, current_content_path, read_json, save_raw, write_json_atomic
 from .tasks import TaskControl, TaskStopped
-from .utils import utcnow_iso
+from .utils import bookmark_url, utcnow_iso
 from .verify import run_verify, validation_result
 from .truth import article_truth, index_truth, validate_downloaded_asset, validated_reading_content, resource_state
 
 WEB = Path(__file__).parent / 'dashboard'
+BRAND = WEB.parent / 'ui'
 ACTIVE = {'running', 'stopping'}
 # sync 是面向用户的唯一主任务：读列表 → 下载正文 → 整理 → 下载图片，一次走完。
 # 其余种类保留给命令行、测试和「重新下载某几篇」这类局部操作。
 LABELS = {'sync': '下载全部', 'index': '更新收藏列表', 'archive': '抓取文章', 'assets': '补齐图片',
           'export': '导出所选文章', 'export_images': '导出文章图片',
-          'verify': '校验归档', 'connection': '验证百度连接'}
+          'verify': '校验归档', 'connection': '验证百度连接', 'retry_images': '补救缺失图片'}
 
 
 class InputError(ValueError):
@@ -105,6 +106,7 @@ class Application:
                                 'date': meta.get('content_date') or record.get('list_date') or '',
                                 'type': record['type'], 'status': facts['status'],
                                 'available': available, 'position': record.get('global_position'),
+                                'bookmark_available': bool(bookmark_url(record)),
                                 'excerpt': (record.get('list_desc') or '')[:140],
                                 **asset_counts.get(key, {'images': 0, 'downloaded': 0, 'failed': 0, 'legacy_unverified': 0, 'legacy_saved': 0})})
             history = [{'command': r['command'], 'started_at': r['started_at'],
@@ -123,7 +125,8 @@ class Application:
                                 'downloaded': sum(r['downloaded'] for r in records),
                                 'legacy_images': sum(r['legacy_unverified'] for r in records),
                                 'legacy_saved_images': sum(r['legacy_saved'] for r in records),
-                                'failed_images': sum(r['failed'] for r in records)}}
+                                'failed_images': sum(r['failed'] for r in records),
+                                'external_embeds': sum(a['kind'] in {'embed', 'iframe', 'object'} for a in all_assets)}}
 
     def settings(self):
         return {**{k: getattr(self.config, k) for k in ('concurrency', 'delay', 'page_limit')},
@@ -181,6 +184,17 @@ class Application:
             guard = ArchiveLock(self.config.root)
             guard.__enter__()
             try:
+                if kind == 'retry_images':
+                    asset_ids = data.get('asset_ids')
+                    if (not isinstance(asset_ids, list) or not asset_ids or len(asset_ids) > 2000
+                            or any(type(asset_id) is not int or asset_id <= 0 or asset_id >= 2**63 for asset_id in asset_ids)):
+                        raise InputError('请选择要补救的图片')
+                    args['asset_ids'] = list(dict.fromkeys(asset_ids))
+                    with ArchiveState(self.config.db_path) as state:
+                        for asset_id in args['asset_ids']:
+                            asset = state.get_asset(asset_id)
+                            if not asset or asset['kind'] != 'image' or not asset.get('downloadable'):
+                                raise InputError('选中的图片已不在可补救的资源中，请刷新后重试')
                 if kind in {'archive', 'assets', 'export', 'export_images'}:
                     keys = data.get('keys')
                     if kind == 'export_images':
@@ -215,7 +229,7 @@ class Application:
                 self.control = TaskControl()
                 self.job = {'id': uuid4().hex, 'kind': kind, 'label': LABELS[kind], 'status': 'running',
                             'phase': '准备', 'message': '任务已开始', 'started_at': utcnow_iso(),
-                            'done': 0, 'total': len(args['keys']), 'args': args, 'events': [], 'download': None}
+                            'done': 0, 'total': len(args.get('asset_ids', args['keys'])), 'args': args, 'events': [], 'download': None}
                 write_json_atomic(self.job_path, self.job)
                 self.thread = threading.Thread(target=self.work, args=(args, guard), daemon=True)
                 self.thread.start()
@@ -244,6 +258,7 @@ class Application:
                     published = Path(result['path'])
                     self.control.check()
                     stats['download'] = '/download/' + Path(result['path']).name
+                    stats['failed'] = result.get('missing_resources', result.get('not_downloaded', 0))
                     self.update(download=stats['download'], result={k: v for k, v in result.items() if k != 'path'})
                 elif kind == 'verify':
                     if args.get('rebuild_legacy'):
@@ -298,26 +313,37 @@ class Application:
                             if args['images'] or kind == 'sync':
                                 assets = stage('下载图片', lambda: run_assets(config, state, client, only_keys=keys, log=self.log))
                                 stats['failed'] += assets.get('failed', 0)
+                        elif kind == 'retry_images':
+                            result = stage('仅处理选中的图片', lambda: retry_missing_images(
+                                config, state, client, asset_ids=args['asset_ids'], log=self.log))
+                            stats.update(result)
+                            self.update(result=result)
                         elif kind == 'assets':
                             assets = stage('补齐图片', lambda: run_assets(config, state, client, only_keys=keys, log=self.log))
                             stats['failed'] = assets.get('failed', 0)
                 if kind in {'archive', 'assets', 'sync'}:
                     stats['failed'] = max(stats.get('failed', 0), sum(
                         not article_truth(config, state, key)['complete'] for key in keys))
-                export_master_index(config, state)
+                if kind != 'retry_images':
+                    export_master_index(config, state)
                 status = 'partial' if stats.get('failed') else 'completed'
                 message = ('任务完成，部分内容仍待补齐。已保存的数据可继续使用。' if status == 'partial' else
                            '百度连接正常，可以更新列表和抓取文章。' if kind == 'connection' else '任务完成，结果已保存。')
                 if kind == 'export_images':
                     message = f"已打包 {result['images']} 张图片，范围 {result['count']} 篇文章。"
                     if result['not_downloaded']:
-                        message += f"另有 {result['not_downloaded']} 个图片引用尚未下载，已列入 ZIP 清单。"
+                        message += f"另有 {result['not_downloaded']} 个图片引用未纳入，原因已列入 ZIP 清单。"
+                if kind == 'export' and result['missing_resources']:
+                    message = f"已导出 {result['count']} 篇正文。{result['missing_resources']} 个资源引用未纳入，原因已列入 ZIP 清单。"
                 if kind == 'verify':
                     message = '校验通过，归档完整。' if validation['ok'] else '校验未通过，请查看缺失数量与完整性检查。'
+                if kind == 'retry_images':
+                    message = f"补回 {result['recovered']} 个图片引用，仍缺失 {result['failed']} 个，跳过 {result['skipped']} 个。"
                 # 停止与完成共用锁：已接收停止信号的任务不能再次标记 completed。
                 with self.lock:
                     self.control.check()
-                    self.update(status=status, phase='已结束', finished_at=utcnow_iso(), done=len(keys), message=message)
+                    self.update(status=status, phase='已结束', finished_at=utcnow_iso(),
+                                done=len(args.get('asset_ids', keys)), message=message)
         except (TaskStopped, KeyboardInterrupt):
             self.update(status='stopped', message='任务已停止，已保存的内容保留。点击继续任务即可续传。')
         except AuthExpired:
@@ -331,7 +357,7 @@ class Application:
             self.update(status='failed', message=f'任务未完成（{type(exc).__name__}），可检查连接后重试。')
         finally:
             try:
-                if published and self.snapshot()['status'] != 'completed':
+                if published and self.snapshot()['status'] not in {'completed', 'partial'}:
                     published.unlink(missing_ok=True)
                     self.update(download=None, result=None)
             finally:
@@ -374,7 +400,7 @@ class Application:
                 else:
                     node.attrs.pop('srcset', None)
             title = html.escape(meta.get('title') or record.get('title') or '无标题')
-            return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><link rel="stylesheet" href="/dashboard.css">
+            return f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><link rel="stylesheet" href="/brand.css"><link rel="stylesheet" href="/dashboard.css">
 <title>{title} · 百度空间归档</title><body class="article-body"><h1>{title}</h1>
 <p class="muted">收藏于 {html.escape(meta.get('content_date') or record.get('list_date') or '未知日期')}</p>
 <article>{str(soup)}</article></body></html>'''.encode()
@@ -432,9 +458,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(app.library())
             if path == '/api/job':
                 return self.send(app.snapshot())
-            if path in {'/', '/index.html', '/dashboard.css', '/dashboard.js', '/logo.svg'}:
+            if path in {'/', '/index.html', '/dashboard.css', '/dashboard.js'}:
                 filename = 'index.html' if path in {'/', '/index.html'} else path[1:]
                 return self.send((WEB / filename).read_bytes(), mimetypes.guess_type(filename)[0] or 'text/plain')
+            if path in {'/brand.css', '/icon.png'}:
+                return self.send((BRAND / path[1:]).read_bytes(), 'text/css' if path.endswith('.css') else 'image/png')
             if path == '/article':
                 return self.send(app.article(parse_qs(url.query).get('key', [''])[0]), 'text/html; charset=utf-8')
             parts = path.strip('/').split('/')

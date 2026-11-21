@@ -65,8 +65,17 @@ def test_selection_bundle_keeps_markdown_image_paths_valid(archive):
         assert b"assets/local.png" in archive.read("articles/first/content.md")
         assert archive.read("articles/first/assets/local.png") == body
     (folder / "assets" / "local.png").write_bytes(b"corrupt")
-    with pytest.raises(IntegrityError):
-        export_selection(config, state, keys=["first"], formats=["md"])
+    result = export_selection(config, state, keys=["first", "second"], formats=["md", "txt"])
+    with zipfile.ZipFile(result["path"]) as bundle:
+        assert "正文" in bundle.read("articles/first/content.txt").decode()
+        markdown = bundle.read("articles/first/content.md").decode()
+        assert "图片未保存" in markdown and "assets/local.png" not in markdown
+        assert "articles/first/assets/local.png" not in bundle.namelist()
+        assert "articles/second/content.md" in bundle.namelist()
+        manifest = json.loads(bundle.read("manifest.json"))
+        assert manifest['count'] == 2 and manifest['missing_resources'] == 1
+        assert manifest['entries'][0]['missing_resources'][0]['status'] == 'failed_integrity'
+    assert (folder / 'assets' / 'local.png').read_bytes() == b'corrupt'
 
 
 def test_selection_never_overwrites_existing_export(archive):
@@ -87,6 +96,45 @@ def add_image(config, state, key='first', url='https://example.test/image?sign=P
     state.upsert_asset(key, {'kind': kind, 'original_url': url, 'attribute': 'src'})
     state.record_asset_result(key, url, 'src', download_status='ok', local_path=local, sha256=sha256_bytes(body))
     return path
+
+
+def test_verified_placeholder_does_not_block_either_zip(archive, monkeypatch):
+    from PIL import Image
+
+    from baidu_archive.media import KNOWN_PLACEHOLDERS
+    from baidu_archive.selection import export_images
+
+    config, state = archive
+    good = add_image(config, state, url='https://example.test/good.png')
+    placeholder_url = 'https://example.test/gone.png?sign=PRIVATE'
+    placeholder = add_image(config, state, url=placeholder_url, local='assets/placeholder.png')
+    Image.new('RGB', (4, 4), 'white').save(placeholder)
+    original = placeholder.read_bytes()
+    digest = sha256_bytes(original)
+    monkeypatch.setitem(KNOWN_PLACEHOLDERS, digest, 'test placeholder')
+    state.record_asset_result('first', placeholder_url, 'src', sha256=digest)
+    (config.item_dir('first') / 'content.original.html').write_text(
+        '<p>保留的正文</p><img src="assets/same.png"><img src="assets/placeholder.png">', encoding='utf-8')
+
+    text = export_selection(config, state, keys=['first', 'second'], formats=['md', 'txt'])
+    with zipfile.ZipFile(text['path']) as bundle:
+        manifest = json.loads(bundle.read('manifest.json'))
+        assert manifest['count'] == 2 and manifest['missing_resources'] == 1
+        assert manifest['entries'][0]['missing_resources'][0]['status'] == 'source_placeholder'
+        assert b'PRIVATE' not in bundle.read('manifest.json')
+        md = bundle.read('articles/first/content.md').decode()
+        assert '保留的正文' in md and 'assets/same.png' in md and '图片未保存' in md
+        assert 'assets/placeholder.png' not in md
+        assert bundle.read('articles/first/assets/same.png') == good.read_bytes()
+
+    pictures = export_images(config, state, keys=['first', 'second'])
+    with zipfile.ZipFile(pictures['path']) as bundle:
+        manifest = json.loads(bundle.read('manifest.json'))
+        assert manifest['images'] == 1 and manifest['not_downloaded'] == 1
+        assert manifest['entries'][0]['not_downloaded'][0]['status'] == 'source_placeholder'
+        assert bundle.read(manifest['files'][0]['path']) == good.read_bytes()
+    assert placeholder.read_bytes() == original
+    assert state.assets_for('first')[1]['download_status'] == 'ok'
 
 
 def test_images_only_chosen_current_images_and_safe_manifest(archive):
@@ -122,6 +170,29 @@ def test_images_duplicate_references_deduplicate_files_and_separate_articles(arc
         assert result['images'] == 2
         assert manifest['entries'][0]['image_references'] == 2
         assert len(set(bundle.namelist())) == 3
+
+
+@pytest.mark.parametrize('damage', ['corrupt', 'missing', 'escape'])
+def test_image_zip_keeps_verified_images_beside_unusable_items(archive, damage):
+    from baidu_archive.selection import export_images
+
+    config, state = archive
+    url = 'https://example.test/image?sign=PRIVATE'
+    rejected = add_image(config, state, url=url)
+    good = add_image(config, state, 'second')
+    if damage == 'corrupt':
+        rejected.write_bytes(b'broken')
+    elif damage == 'missing':
+        rejected.unlink()
+    else:
+        state.record_asset_result('first', url, 'src', local_path='../outside.png')
+    result = export_images(config, state, keys=['first', 'second'])
+    with zipfile.ZipFile(result['path']) as bundle:
+        manifest = json.loads(bundle.read('manifest.json'))
+        assert result['images'] == 1 and result['not_downloaded'] == 1
+        assert manifest['entries'][0]['not_downloaded'][0]['status'] == 'failed_integrity'
+        assert bundle.read(manifest['files'][0]['path']) == good.read_bytes()
+        assert b'PRIVATE' not in bundle.read('manifest.json')
 
 
 @pytest.mark.parametrize('failure', ['empty', 'corrupt', 'missing', 'escape', 'stopped', 'inactive'])

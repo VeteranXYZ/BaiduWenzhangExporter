@@ -10,9 +10,11 @@
 from __future__ import annotations
 
 import threading
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+from urllib.parse import urlsplit
 
-import webview
+if TYPE_CHECKING:
+    import webview
 
 from .auth import AuthError, Credentials, save_cookie_session
 from .config import LIST_URL_CANDIDATES, Config
@@ -64,6 +66,8 @@ def open_login_window(
     user_agent: str | None = None,
 ) -> webview.Window:
     """打开登录窗口并在成功后保存凭证。立即返回，结果通过 ``on_result`` 回调。"""
+    import webview
+
     window = webview.create_window(
         "登录百度",
         url=ENTRY_URL,
@@ -89,11 +93,12 @@ def open_login_window(
         if finished.is_set():
             return
         try:
-            current = window.get_current_url() or ""
+            current = urlsplit(window.get_current_url() or "")
+            if (current.scheme != "https" or current.hostname != SUCCESS_HOST
+                    or current.port not in (None, 443) or current.username is not None):
+                return
         except Exception:  # noqa: BLE001
             return
-        if SUCCESS_HOST not in current:
-            return                        # 还在登录页/中转页，继续等
         try:
             header = cookie_header_from(window.get_cookies())
         except Exception:  # noqa: BLE001

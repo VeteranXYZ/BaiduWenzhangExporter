@@ -56,6 +56,14 @@
       const title = element(entry.available ? 'a' : 'span', 'record-title', entry.title);
       if (entry.available) title.href = entry.href;
       content.append(title, element('p', 'excerpt', entry.excerpt || '仅保存收藏记录，正文尚未归档。'));
+      if (entry.bookmark_url) {
+        const link = element('a', 'record-source', '打开原地址');
+        link.href = entry.bookmark_url;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.setAttribute('aria-label', `打开原地址 ${entry.title}`);
+        content.append(link);
+      }
       const meta = element('div', 'record-meta');
       meta.append(element('span', '', entry.source), element('span', '', entry.type === 'page' ? '空间文章' : '其他收藏'));
       content.append(meta);
